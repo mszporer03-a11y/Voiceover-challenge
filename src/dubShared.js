@@ -1,4 +1,4 @@
-import { addClip, deleteClip, getAllClips } from './db.js';
+import { addClip, updateClip, deleteClip, getAllClips } from './db.js';
 import { decodeVideoAudio, detectSpeechSegments, estimateCharacterClusters } from './audioAnalysis.js';
 import { getMonoSamples, computePeaks, drawWaveform } from './waveform.js';
 import { mountWaveformEditor } from './waveformEditor.js';
@@ -169,11 +169,15 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
         <div class="solo-clip-meta">${clip.characters.length} personagem(ns) · ${clip.segments.length} fala(s)</div>
         <div class="solo-clip-actions">
           <button class="menu-btn-secondary solo-clip-play" type="button">${pickLabel ?? '▶ Jogar'}</button>
+          <button class="menu-link solo-clip-edit" type="button">✏ Editar falas</button>
           <button class="menu-link solo-clip-delete" type="button">Remover</button>
         </div>
       </div>
     `);
     card.querySelector('.solo-clip-play').addEventListener('click', () => onPick?.(clip));
+    card.querySelector('.solo-clip-edit').addEventListener('click', () => {
+      renderEditTaggingScreen(cardEl, resources, clip, { onSaved: refresh, onCancel: refresh });
+    });
     card.querySelector('.solo-clip-delete').addEventListener('click', async () => {
       await deleteClip(clip.id);
       refresh();
@@ -220,15 +224,50 @@ async function renderTaggingScreen(cardEl, resources, file, { onSaved, onCancel 
   renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel, audioBuffer });
 }
 
-function renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel, audioBuffer }) {
+// Reabre um clipe já salvo na galeria pra reajustar a posição/duração das
+// falas (ou personagem), sem precisar re-detectar tudo do zero — reaproveita
+// os trechos já marcados como ponto de partida.
+async function renderEditTaggingScreen(cardEl, resources, clip, { onSaved, onCancel } = {}) {
+  cardEl.innerHTML = `
+    <h2 class="menu-logo" style="font-size:22px;">EDITAR CLIPE</h2>
+    <p class="menu-status">Carregando áudio, aguarde…</p>
+  `;
+
+  const videoUrl = resources.trackUrl(URL.createObjectURL(clip.videoBlob));
+  const previewVideo = document.createElement('video');
+  previewVideo.src = videoUrl;
+  previewVideo.preload = 'auto';
+  previewVideo.style.display = 'none';
+  cardEl.appendChild(previewVideo);
+  await new Promise((resolve) => previewVideo.addEventListener('loadedmetadata', resolve, { once: true }));
+
+  let audioBuffer = null;
+  try {
+    audioBuffer = await decodeVideoAudio(clip.videoBlob);
+  } catch {
+    audioBuffer = null;
+  }
+
+  const rows = clip.segments.map((seg) => ({ ...seg }));
+
+  renderTaggingForm(cardEl, clip.videoBlob, previewVideo, rows, {
+    onSaved,
+    onCancel,
+    audioBuffer,
+    clipId: clip.id,
+    initialName: clip.name,
+  });
+}
+
+function renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel, audioBuffer, clipId, initialName }) {
   previewVideo.style.display = '';
   previewVideo.controls = true;
   previewVideo.className = 'solo-preview-video';
 
   cardEl.innerHTML = `
-    <h2 class="menu-logo" style="font-size:20px; margin-bottom:-8px;">NOVO CLIPE</h2>
+    <h2 class="menu-logo" style="font-size:20px; margin-bottom:-8px;">${clipId ? 'EDITAR CLIPE' : 'NOVO CLIPE'}</h2>
     <p class="menu-tagline" style="margin-bottom:-4px;">Arraste na waveform pra marcar uma fala, ou ajuste as bordas de uma existente</p>
-    <input id="solo-clip-name" type="text" placeholder="Nome do clipe" value="${file.name.replace(/\.[^.]+$/, '')}" />
+    <input id="solo-clip-name" type="text" placeholder="Nome do clipe" value="${(initialName ?? file.name.replace(/\.[^.]+$/, '')).replace(/"/g, '&quot;')}" />
     <div id="solo-video-slot"></div>
     <div class="waveform-wrap">
       <div id="solo-waveform-overview" class="waveform-strip">
@@ -248,7 +287,7 @@ function renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel
     <datalist id="solo-character-options"></datalist>
     <div class="menu-section" style="margin-top:12px;">
       <button id="solo-add-segment-btn" class="menu-btn-secondary" type="button">+ Adicionar trecho manual</button>
-      <button id="solo-save-clip-btn" class="menu-btn-primary" type="button">💾 Salvar na galeria</button>
+      <button id="solo-save-clip-btn" class="menu-btn-primary" type="button">${clipId ? '💾 Salvar alterações' : '💾 Salvar na galeria'}</button>
       <button id="solo-cancel-tag-btn" class="menu-link" type="button">Cancelar</button>
     </div>
     <p id="solo-tag-status" class="menu-status"></p>
@@ -365,14 +404,16 @@ function renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel
     statusEl.textContent = 'Salvando…';
     const thumbnailDataUrl = await captureThumbnail(previewVideo);
     const characters = [...new Set(rows.map((r) => r.character))];
-    await addClip({
+    const payload = {
       name,
       videoBlob: file,
       thumbnailDataUrl,
       durationSec: previewVideo.duration || 0,
       segments: rows.map((r) => ({ id: r.id, start: r.start, end: r.end, character: r.character })),
       characters,
-    });
+    };
+    if (clipId) await updateClip(clipId, payload);
+    else await addClip(payload);
     onSaved?.();
   });
 }

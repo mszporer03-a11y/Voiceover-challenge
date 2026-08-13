@@ -64,6 +64,13 @@ export async function getClip(id) {
   return withStore(STORE_NAME, 'readonly', (store) => store.get(id));
 }
 
+export async function updateClip(id, patch) {
+  const existing = await getClip(id);
+  const record = { ...existing, ...patch, id, createdAt: existing?.createdAt ?? Date.now() };
+  await withStore(STORE_NAME, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
 export async function getRandomClip() {
   const clips = await getAllClips();
   if (!clips.length) return null;
