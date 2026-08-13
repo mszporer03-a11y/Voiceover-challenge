@@ -1,6 +1,6 @@
 import { io } from 'socket.io-client';
 
-const SERVER_URL = 'https://voiceover-challenge-production.up.railway.app';
+export const SERVER_URL = 'https://voiceover-challenge-production.up.railway.app';
 
 export const socket = io(SERVER_URL, { autoConnect: false });
 

@@ -1,9 +1,11 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { cloudEnabled, listClips, getUploadUrl, registerClip, deleteClip as deleteCloudClip } from './storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -11,6 +13,7 @@ const MAX_PLAYERS = 8;
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -35,14 +38,68 @@ const io = new Server(httpServer, {
 const rooms = new Map();
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, rooms: rooms.size });
+  res.json({ ok: true, rooms: rooms.size, cloud: cloudEnabled });
+});
+
+// Galeria compartilhada em Cloudflare R2 (object storage, sem custo de
+// banda). O servidor nunca vê o vídeo em si: gera uma URL assinada e o
+// navegador manda o binário direto pro bucket; aqui só passam metadados
+// (nome, falas, personagens) e a URL pública final pra download.
+app.get('/api/clips', async (req, res) => {
+  if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
+  try {
+    res.json({ clips: await listClips() });
+  } catch {
+    res.status(500).json({ error: 'Falha ao listar clipes da nuvem.' });
+  }
+});
+
+app.post('/api/clips/upload-url', async (req, res) => {
+  if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
+  const { hash, ext, contentType } = req.body || {};
+  if (!hash || !ext) return res.status(400).json({ error: 'hash e ext são obrigatórios.' });
+  try {
+    res.json(await getUploadUrl(hash, ext, contentType || 'video/webm'));
+  } catch {
+    res.status(500).json({ error: 'Falha ao gerar URL de upload.' });
+  }
+});
+
+app.post('/api/clips', async (req, res) => {
+  if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
+  const { hash, key, name, durationSec, segments, characters, sizeBytes } = req.body || {};
+  if (!hash || !key || !Array.isArray(segments)) return res.status(400).json({ error: 'Dados incompletos.' });
+  try {
+    const entry = await registerClip({
+      hash,
+      key,
+      name: name || 'Clipe sem nome',
+      durationSec: durationSec || 0,
+      segments,
+      characters: characters || [],
+      sizeBytes: sizeBytes || 0,
+    });
+    res.json(entry);
+  } catch {
+    res.status(500).json({ error: 'Falha ao registrar clipe.' });
+  }
+});
+
+app.delete('/api/clips/:hash', async (req, res) => {
+  if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
+  try {
+    await deleteCloudClip(req.params.hash);
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: 'Falha ao remover clipe.' });
+  }
 });
 
 // Serve the built game client (npm run build -> dist/), so visiting the
 // server URL directly loads the actual game instead of "Cannot GET /".
 const distPath = path.join(__dirname, '..', 'dist');
 app.use(express.static(distPath));
-app.get(/^(?!\/health|\/socket\.io).*/, (req, res, next) => {
+app.get(/^(?!\/health|\/socket\.io|\/api).*/, (req, res, next) => {
   res.sendFile(path.join(distPath, 'index.html'), (err) => {
     if (err) next();
   });
@@ -184,6 +241,9 @@ io.on('connection', (socket) => {
       durationSec: c.durationSec || 0,
       segments: c.segments,
       characters: c.characters || [],
+      // Se o clipe já foi compartilhado na galeria da nuvem, os outros
+      // jogadores baixam direto do R2 em vez de receber via WebRTC P2P.
+      cloudUrl: c.cloudUrl || null,
     }));
     room.clipReadyIds = new Set([room.hostId]);
     broadcastRoom(currentRoomId);

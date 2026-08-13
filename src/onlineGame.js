@@ -1,5 +1,6 @@
 import { socket } from './socket.js';
 import { sendFileToAllPeers } from './webrtc.js';
+import { fetchCloudClipBlob } from './cloudClips.js';
 import {
   createResources,
   renderGalleryScreen,
@@ -61,6 +62,7 @@ export function initOnlineGame({ overlayId, openBtnId } = {}) {
     else if (roundChanged) receiveProgress.clear();
     if (overlayEl.classList.contains('menu-hidden')) return;
     maybeAutoConfirmClipReady();
+    maybeFetchCloudClips();
     render();
   });
 
@@ -72,10 +74,13 @@ function resetRoundState() {
   clipReadySent = false;
   allRecordings.clear();
   receiveProgress.clear();
+  fetchingCloudClips.clear();
 }
 
 function open() {
   overlayEl.classList.remove('menu-hidden');
+  maybeAutoConfirmClipReady();
+  maybeFetchCloudClips();
   render();
 }
 
@@ -138,6 +143,36 @@ function maybeAutoConfirmClipReady() {
   if (!total || sharedClips.filter(Boolean).length < total) return;
   clipReadySent = true;
   socket.emit('clip-ready');
+}
+
+// Clipes já compartilhados na galeria da nuvem (cloudUrl) chegam pra cada
+// jogador via HTTP direto do R2, em vez de esperar a transferência P2P do
+// host — mais rápido e reaproveita o mesmo objeto pra futuras partidas.
+const fetchingCloudClips = new Set();
+async function maybeFetchCloudClips() {
+  if (isHost() || latestSnapshot?.gameState !== 'PICKING') return;
+  const clips = latestSnapshot.clips || [];
+  for (let clipIndex = 0; clipIndex < clips.length; clipIndex++) {
+    const meta = clips[clipIndex];
+    if (!meta?.cloudUrl || sharedClips[clipIndex] || fetchingCloudClips.has(clipIndex)) continue;
+    fetchingCloudClips.add(clipIndex);
+    try {
+      const blob = await fetchCloudClipBlob(meta.cloudUrl);
+      sharedClips[clipIndex] = {
+        name: meta.name,
+        durationSec: meta.durationSec,
+        segments: meta.segments,
+        characters: meta.characters,
+        videoBlob: blob,
+      };
+      maybeAutoConfirmClipReady();
+      render();
+    } catch {
+      // tenta de novo no próximo room-update
+    } finally {
+      fetchingCloudClips.delete(clipIndex);
+    }
+  }
 }
 
 // ---------- Rendering ----------
@@ -246,13 +281,17 @@ async function hostStartGame() {
       durationSec: c.durationSec,
       segments: c.segments,
       characters: c.characters,
+      cloudUrl: c.cloudUrl || null,
     })),
   });
   render();
+  // Clipes já compartilhados na nuvem: os outros jogadores baixam sozinhos
+  // via HTTP (maybeFetchCloudClips), não precisa mandar por WebRTC.
   await Promise.all(
-    sharedClips.map((clip, clipIndex) =>
-      sendFileToAllPeers(clip.videoBlob, { kind: 'clip', clipIndex, mime: clip.videoBlob.type })
-    )
+    sharedClips.map((clip, clipIndex) => {
+      if (clip.cloudUrl) return Promise.resolve();
+      return sendFileToAllPeers(clip.videoBlob, { kind: 'clip', clipIndex, mime: clip.videoBlob.type });
+    })
   );
 }
 

@@ -3,6 +3,7 @@ import { decodeVideoAudio, detectSpeechSegments, estimateCharacterClusters } fro
 import { getMonoSamples, computePeaks, drawWaveform } from './waveform.js';
 import { mountWaveformEditor } from './waveformEditor.js';
 import { exportDubbedVideo, downloadBlob } from './exportVideo.js';
+import { listCloudClips, uploadClipToCloud, fetchCloudClipBlob, deleteCloudClip } from './cloudClips.js';
 
 // Peças reaproveitáveis entre o Modo Solo e os modos Multiplayer local:
 // galeria/tagging de clipes, tela de "ver original", gravação guiada fala
@@ -129,6 +130,11 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
         .join('')}
       ${onClose ? `<button id="dub-gallery-close-btn" class="menu-link" type="button">${closeLabel ?? 'Fechar'}</button>` : ''}
     </div>
+    <div id="dub-cloud-section" hidden>
+      <h3 class="menu-logo" style="font-size:16px; margin-top:14px;">☁ GALERIA DA NUVEM</h3>
+      <p class="menu-tagline" style="margin-bottom:-4px;">Clipes salvos por qualquer jogador, disponíveis em qualquer aparelho</p>
+      <div id="dub-cloud-grid" class="solo-gallery-grid"><p class="menu-status">Carregando…</p></div>
+    </div>
   `;
 
   const refresh = () => renderGalleryScreen(cardEl, resources, opts);
@@ -157,11 +163,13 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
 
   if (!clips.length) {
     grid.innerHTML = `<p class="menu-status">Nenhum clipe na galeria ainda. Adicione um pra começar!</p>`;
+    loadCloudGrid(cardEl, resources, { pickLabel, onPick, refresh });
     return;
   }
 
   grid.innerHTML = '';
   clips.forEach((clip) => {
+    const shareLabel = clip.cloudUrl ? '☁ Compartilhado' : '☁ Compartilhar';
     const card = el(`
       <div class="solo-clip-card">
         <img src="${clip.thumbnailDataUrl}" alt="${clip.name}" />
@@ -170,6 +178,7 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
         <div class="solo-clip-actions">
           <button class="menu-btn-secondary solo-clip-play" type="button">${pickLabel ?? '▶ Jogar'}</button>
           <button class="menu-link solo-clip-edit" type="button">✏ Editar falas</button>
+          <button class="menu-link solo-clip-share" type="button" ${clip.cloudUrl ? 'disabled' : ''}>${shareLabel}</button>
           <button class="menu-link solo-clip-delete" type="button">Remover</button>
         </div>
       </div>
@@ -178,9 +187,108 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
     card.querySelector('.solo-clip-edit').addEventListener('click', () => {
       renderEditTaggingScreen(cardEl, resources, clip, { onSaved: refresh, onCancel: refresh });
     });
+    card.querySelector('.solo-clip-share').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = '☁ Enviando…';
+      try {
+        const entry = await uploadClipToCloud(clip, (p) => {
+          btn.textContent = `☁ Enviando… ${Math.round(p * 100)}%`;
+        });
+        await updateClip(clip.id, { cloudHash: entry.hash, cloudUrl: entry.url });
+        refresh();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = shareLabel;
+        alert(`Não foi possível compartilhar: ${err.message}`);
+      }
+    });
     card.querySelector('.solo-clip-delete').addEventListener('click', async () => {
       await deleteClip(clip.id);
       refresh();
+    });
+    grid.appendChild(card);
+  });
+
+  loadCloudGrid(cardEl, resources, { pickLabel, onPick, refresh });
+}
+
+async function loadCloudGrid(cardEl, resources, { pickLabel, onPick, refresh }) {
+  const section = cardEl.querySelector('#dub-cloud-section');
+  const grid = cardEl.querySelector('#dub-cloud-grid');
+  if (!section || !grid) return;
+
+  let cloudClips;
+  try {
+    cloudClips = await listCloudClips();
+  } catch {
+    return; // nuvem não configurada ou indisponível — some sem incomodar
+  }
+  if (!cardEl.querySelector('#dub-cloud-grid')) return; // tela já mudou
+
+  section.hidden = false;
+  if (!cloudClips.length) {
+    grid.innerHTML = `<p class="menu-status">Nenhum clipe compartilhado ainda.</p>`;
+    return;
+  }
+
+  const localClips = await getAllClips();
+  const localHashes = new Set(localClips.map((c) => c.cloudHash).filter(Boolean));
+
+  grid.innerHTML = '';
+  cloudClips.forEach((entry) => {
+    const alreadyLocal = localHashes.has(entry.hash);
+    const card = el(`
+      <div class="solo-clip-card">
+        <div class="solo-clip-name">${entry.name}</div>
+        <div class="solo-clip-meta">${(entry.characters || []).length} personagem(ns) · ${(entry.segments || []).length} fala(s) · ${((entry.sizeBytes || 0) / 1e6).toFixed(1)}MB</div>
+        <div class="solo-clip-actions">
+          <button class="menu-btn-secondary cloud-clip-get" type="button">${alreadyLocal ? (pickLabel ?? '▶ Jogar') : '⬇ Baixar'}</button>
+          <button class="menu-link cloud-clip-delete" type="button">Remover da nuvem</button>
+        </div>
+      </div>
+    `);
+    card.querySelector('.cloud-clip-get').addEventListener('click', async (e) => {
+      if (alreadyLocal) {
+        onPick?.(localClips.find((c) => c.cloudHash === entry.hash));
+        return;
+      }
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = '⬇ Baixando…';
+      try {
+        const videoBlob = await fetchCloudClipBlob(entry.url);
+        const video = document.createElement('video');
+        video.src = URL.createObjectURL(videoBlob);
+        await new Promise((resolve) => video.addEventListener('loadedmetadata', resolve, { once: true }));
+        const thumbnailDataUrl = await captureThumbnail(video);
+        URL.revokeObjectURL(video.src);
+        const saved = await addClip({
+          name: entry.name,
+          videoBlob,
+          thumbnailDataUrl,
+          durationSec: entry.durationSec || video.duration,
+          segments: entry.segments,
+          characters: entry.characters || [],
+          cloudHash: entry.hash,
+          cloudUrl: entry.url,
+        });
+        if (onPick) onPick(saved);
+        else refresh();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = '⬇ Baixar';
+        alert(`Falha ao baixar: ${err.message}`);
+      }
+    });
+    card.querySelector('.cloud-clip-delete').addEventListener('click', async () => {
+      if (!confirm(`Remover "${entry.name}" da nuvem? Isso não apaga cópias locais já baixadas.`)) return;
+      try {
+        await deleteCloudClip(entry.hash);
+        refresh();
+      } catch (err) {
+        alert(`Falha ao remover: ${err.message}`);
+      }
     });
     grid.appendChild(card);
   });
