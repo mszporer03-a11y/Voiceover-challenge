@@ -2,7 +2,10 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 8;
 
@@ -33,6 +36,16 @@ const rooms = new Map();
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, rooms: rooms.size });
+});
+
+// Serve the built game client (npm run build -> dist/), so visiting the
+// server URL directly loads the actual game instead of "Cannot GET /".
+const distPath = path.join(__dirname, '..', 'dist');
+app.use(express.static(distPath));
+app.get(/^(?!\/health|\/socket\.io).*/, (req, res, next) => {
+  res.sendFile(path.join(distPath, 'index.html'), (err) => {
+    if (err) next();
+  });
 });
 
 function makeRoomId() {
