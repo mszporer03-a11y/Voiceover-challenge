@@ -43,6 +43,28 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, rooms: rooms.size, cloud: cloudEnabled });
 });
 
+// TEMP: diagnóstico do UPLOADTHING_TOKEN sem expor o valor em si — remover
+// depois de descobrir por que a validação do SDK está rejeitando o token.
+app.get('/api/_debug/token', (req, res) => {
+  const raw = process.env.UPLOADTHING_TOKEN || '';
+  let decoded = null;
+  let parseError = null;
+  try {
+    decoded = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+  } catch (e) {
+    parseError = e.message;
+  }
+  res.json({
+    length: raw.length,
+    first12: raw.slice(0, 12),
+    last12: raw.slice(-12),
+    hasWhitespaceOrQuotes: /[\s"']/.test(raw),
+    containsLiteralVarName: raw.includes('UPLOADTHING_TOKEN'),
+    decodedKeys: decoded ? Object.keys(decoded) : null,
+    parseError,
+  });
+});
+
 // Galeria compartilhada via UploadThing (free, sem cartão de crédito
 // exigido). O vídeo sobe pro nosso servidor (multipart) e é repassado pro
 // UploadThing dali; metadados (nome, falas, personagens) ficam num índice
