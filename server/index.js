@@ -5,7 +5,8 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { cloudEnabled, listClips, getUploadUrl, registerClip, deleteClip as deleteCloudClip } from './storage.js';
+import multer from 'multer';
+import { cloudEnabled, listClips, uploadAndRegisterClip, deleteClip as deleteCloudClip } from './storage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -14,6 +15,7 @@ const MAX_PLAYERS = 8;
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -41,10 +43,10 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, rooms: rooms.size, cloud: cloudEnabled });
 });
 
-// Galeria compartilhada em Cloudflare R2 (object storage, sem custo de
-// banda). O servidor nunca vê o vídeo em si: gera uma URL assinada e o
-// navegador manda o binário direto pro bucket; aqui só passam metadados
-// (nome, falas, personagens) e a URL pública final pra download.
+// Galeria compartilhada via UploadThing (free, sem cartão de crédito
+// exigido). O vídeo sobe pro nosso servidor (multipart) e é repassado pro
+// UploadThing dali; metadados (nome, falas, personagens) ficam num índice
+// local em disco, deduplicado por hash de conteúdo do próprio arquivo.
 app.get('/api/clips', async (req, res) => {
   if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
   try {
@@ -54,34 +56,33 @@ app.get('/api/clips', async (req, res) => {
   }
 });
 
-app.post('/api/clips/upload-url', async (req, res) => {
+app.post('/api/clips', upload.single('video'), async (req, res) => {
   if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
-  const { hash, ext, contentType } = req.body || {};
-  if (!hash || !ext) return res.status(400).json({ error: 'hash e ext são obrigatórios.' });
+  const { hash, ext, name, durationSec } = req.body || {};
+  let segments, characters;
   try {
-    res.json(await getUploadUrl(hash, ext, contentType || 'video/webm'));
+    segments = JSON.parse(req.body?.segments || '[]');
+    characters = JSON.parse(req.body?.characters || '[]');
   } catch {
-    res.status(500).json({ error: 'Falha ao gerar URL de upload.' });
+    return res.status(400).json({ error: 'segments/characters inválidos.' });
   }
-});
-
-app.post('/api/clips', async (req, res) => {
-  if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
-  const { hash, key, name, durationSec, segments, characters, sizeBytes } = req.body || {};
-  if (!hash || !key || !Array.isArray(segments)) return res.status(400).json({ error: 'Dados incompletos.' });
+  if (!hash || !ext || !req.file || !Array.isArray(segments)) {
+    return res.status(400).json({ error: 'Dados incompletos.' });
+  }
   try {
-    const entry = await registerClip({
+    const entry = await uploadAndRegisterClip({
       hash,
-      key,
+      ext,
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype || 'video/webm',
       name: name || 'Clipe sem nome',
-      durationSec: durationSec || 0,
+      durationSec: Number(durationSec) || 0,
       segments,
-      characters: characters || [],
-      sizeBytes: sizeBytes || 0,
+      characters,
     });
     res.json(entry);
-  } catch {
-    res.status(500).json({ error: 'Falha ao registrar clipe.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Falha ao enviar clipe.' });
   }
 });
 

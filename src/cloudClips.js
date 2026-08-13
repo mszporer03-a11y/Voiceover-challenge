@@ -1,9 +1,9 @@
 import { SERVER_URL } from './socket.js';
 
-// Galeria compartilhada: vídeos vivem no Cloudflare R2, o servidor só guarda
-// metadados. Upload é direto navegador -> R2 via URL assinada (o servidor
-// nunca vê o binário), deduplicado por hash de conteúdo pra não subir o
-// mesmo clipe duas vezes.
+// Galeria compartilhada: vídeos vivem no UploadThing (free, sem cartão de
+// crédito), metadados ficam no nosso servidor. Upload é multipart direto
+// pro nosso servidor, que repassa pro UploadThing — dedup por hash de
+// conteúdo pra não subir o mesmo clipe duas vezes.
 
 async function sha256Hex(blob) {
   const buf = await blob.arrayBuffer();
@@ -38,45 +38,33 @@ export async function uploadClipToCloud(clip, onProgress) {
   const hash = await sha256Hex(clip.videoBlob);
   const ext = extFromType(clip.videoBlob.type);
 
-  const { key, url, exists } = await asJson(
-    await fetch(`${SERVER_URL}/api/clips/upload-url`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hash, ext, contentType: clip.videoBlob.type || 'video/webm' }),
-    })
-  );
+  const form = new FormData();
+  form.append('hash', hash);
+  form.append('ext', ext);
+  form.append('name', clip.name);
+  form.append('durationSec', String(clip.durationSec || 0));
+  form.append('segments', JSON.stringify(clip.segments));
+  form.append('characters', JSON.stringify(clip.characters));
+  form.append('video', clip.videoBlob, `${hash}.${ext}`);
 
-  if (!exists) {
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('PUT', url);
-      xhr.setRequestHeader('Content-Type', clip.videoBlob.type || 'video/webm');
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress?.(e.loaded / e.total);
-      };
-      xhr.onload = () =>
-        xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Upload falhou (${xhr.status})`));
-      xhr.onerror = () => reject(new Error('Upload falhou — verifique CORS do bucket R2.'));
-      xhr.send(clip.videoBlob);
-    });
-  }
-  onProgress?.(1);
-
-  return asJson(
-    await fetch(`${SERVER_URL}/api/clips`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        hash,
-        key,
-        name: clip.name,
-        durationSec: clip.durationSec,
-        segments: clip.segments,
-        characters: clip.characters,
-        sizeBytes: clip.videoBlob.size,
-      }),
-    })
-  );
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${SERVER_URL}/api/clips`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      try {
+        const body = JSON.parse(xhr.responseText);
+        if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+        else reject(new Error(body.error || `Erro ${xhr.status}`));
+      } catch {
+        reject(new Error(`Erro ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload falhou.'));
+    xhr.send(form);
+  });
 }
 
 export async function fetchCloudClipBlob(url) {
