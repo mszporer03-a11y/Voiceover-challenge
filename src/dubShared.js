@@ -784,6 +784,10 @@ export function createSyncedPlayback(video, segments, recordings, resources) {
 
   function tick() {
     const t = video.currentTime;
+    // Só abafa o áudio original enquanto uma fala redublada está tocando —
+    // trechos sem gravação continuam com o áudio original audível.
+    const dubbedSeg = segments.find((seg) => t >= seg.start && t < seg.end && recordings.get(seg.id));
+    video.muted = !!dubbedSeg;
     segments.forEach((seg) => {
       if (t >= seg.start && t < seg.end && !triggered.has(seg.id)) {
         triggered.add(seg.id);
@@ -825,7 +829,7 @@ export function renderResultScreen(cardEl, resources, clip, recordings, opts = {
   cardEl.innerHTML = `
     <h2 class="menu-logo" style="font-size:22px;">${title ?? 'SUA DUBLAGEM'}</h2>
     <p class="menu-tagline">${tagline ?? `${clip.name} — redublado`}</p>
-    <video id="dub-result-video" class="solo-preview-video" src="${videoUrl}" controls muted></video>
+    <video id="dub-result-video" class="solo-preview-video" src="${videoUrl}" controls></video>
     <div class="menu-section" id="dub-result-actions">
       <button id="dub-replay-btn" class="menu-btn-secondary" type="button">🔁 Assistir de novo</button>
       <button id="dub-export-btn" class="menu-btn-secondary" type="button">⬇️ Baixar dublagem</button>

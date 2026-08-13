@@ -1,8 +1,10 @@
 // Re-renders a clip with its recorded dubs mixed in, in real time, and
 // captures the result as a downloadable video file. No server, no
 // ffmpeg — just <video>.captureStream() for the picture and a small Web
-// Audio graph (one MediaElementSource per recorded line, routed into a
-// MediaStreamDestination) for the sound, both fed into one MediaRecorder.
+// Audio graph (one MediaElementSource per recorded line, plus the
+// original video's own audio ducked out only during dubbed segments,
+// routed into a MediaStreamDestination) for the sound, both fed into one
+// MediaRecorder.
 
 function pickSupportedMimeType() {
   const candidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
@@ -17,7 +19,7 @@ function pickSupportedMimeType() {
  */
 export async function exportDubbedVideo(clip, recordings, { onProgress } = {}) {
   const video = document.createElement('video');
-  video.muted = true; // original dialogue stays silent; only the dubs (and gaps) are heard
+  video.muted = true; // no direct-to-speakers output; audio is routed through the Web Audio graph below
   video.playsInline = true;
   const videoUrl = URL.createObjectURL(clip.videoBlob);
   video.src = videoUrl;
@@ -37,6 +39,13 @@ export async function exportDubbedVideo(clip, recordings, { onProgress } = {}) {
 
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const destination = audioCtx.createMediaStreamDestination();
+
+  // Original audio plays through by default; it's ducked to silence only
+  // while a segment with a recorded dub is active, so untouched dialogue
+  // (segments never re-recorded, or gaps between segments) is preserved.
+  const originalGain = audioCtx.createGain();
+  audioCtx.createMediaElementSource(video).connect(originalGain);
+  originalGain.connect(destination);
 
   const videoStream = captureVideoStream.call(video);
   const combinedStream = new MediaStream([
@@ -59,6 +68,8 @@ export async function exportDubbedVideo(clip, recordings, { onProgress } = {}) {
 
   function tick() {
     const t = video.currentTime;
+    const dubbedSeg = clip.segments.find((seg) => t >= seg.start && t < seg.end && recordings.get(seg.id));
+    originalGain.gain.setTargetAtTime(dubbedSeg ? 0 : 1, audioCtx.currentTime, 0.01);
     clip.segments.forEach((seg) => {
       if (t >= seg.start && t < seg.end && !triggered.has(seg.id)) {
         triggered.add(seg.id);
