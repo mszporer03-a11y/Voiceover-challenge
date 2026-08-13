@@ -56,11 +56,14 @@ app.get('/api/_debug/token', (req, res) => {
   }
   res.json({
     length: raw.length,
-    first12: raw.slice(0, 12),
-    last12: raw.slice(-12),
     hasWhitespaceOrQuotes: /[\s"']/.test(raw),
     containsLiteralVarName: raw.includes('UPLOADTHING_TOKEN'),
     decodedKeys: decoded ? Object.keys(decoded) : null,
+    apiKeyStartsWithSk: decoded ? String(decoded.apiKey || '').startsWith('sk_') : null,
+    apiKeyLength: decoded ? String(decoded.apiKey || '').length : null,
+    apiKeyPrefix: decoded ? String(decoded.apiKey || '').slice(0, 4) : null,
+    appIdLength: decoded ? String(decoded.appId || '').length : null,
+    regions: decoded ? decoded.regions : null,
     parseError,
   });
 });
