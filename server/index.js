@@ -43,42 +43,6 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, rooms: rooms.size, cloud: cloudEnabled });
 });
 
-// TEMP: diagnóstico do UPLOADTHING_TOKEN sem expor o valor em si — remover
-// depois de descobrir por que a validação do SDK está rejeitando o token.
-app.get('/api/_debug/token', async (req, res) => {
-  const raw = process.env.UPLOADTHING_TOKEN || '';
-  let decoded = null;
-  let parseError = null;
-  try {
-    decoded = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
-  } catch (e) {
-    parseError = e.message;
-  }
-
-  let liveTest = null;
-  try {
-    const { UTApi } = await import('uploadthing/server');
-    const explicitUtapi = new UTApi({ token: raw });
-    const files = await explicitUtapi.listFiles({ limit: 1 });
-    liveTest = { ok: true, fileCount: files?.files?.length ?? null, hasMore: files?.hasMore ?? null };
-  } catch (e) {
-    liveTest = { ok: false, error: e.message, name: e.name, cause: e.cause?.message };
-  }
-
-  res.json({
-    length: raw.length,
-    hasWhitespaceOrQuotes: /[\s"']/.test(raw),
-    containsLiteralVarName: raw.includes('UPLOADTHING_TOKEN'),
-    decodedKeys: decoded ? Object.keys(decoded) : null,
-    apiKeyStartsWithSk: decoded ? String(decoded.apiKey || '').startsWith('sk_') : null,
-    apiKeyLength: decoded ? String(decoded.apiKey || '').length : null,
-    appIdLength: decoded ? String(decoded.appId || '').length : null,
-    regions: decoded ? decoded.regions : null,
-    parseError,
-    liveTest,
-  });
-});
-
 // Galeria compartilhada via UploadThing (free, sem cartão de crédito
 // exigido). O vídeo sobe pro nosso servidor (multipart) e é repassado pro
 // UploadThing dali; metadados (nome, falas, personagens) ficam num índice
