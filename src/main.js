@@ -1,7 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { PARODY_LIBRARY } from './library.js';
-import { saveTopbarClip, getAllTopbarClips } from './db.js';
 import { initNetwork } from './network.js';
 import { socket } from './socket.js';
 import { initWebRTC, setLocalStream } from './webrtc.js';
@@ -56,76 +54,29 @@ scene.add(keyLight);
 
 scene.add(makeGridFloor());
 
-// ---------- Game show podium ----------
+// ---------- Game show podium + floating "TV screen" (ambient set dressing
+// behind the menu — the game itself plays entirely in the modal overlays
+// below, not on this screen) ----------
 
-const podium = makePodium();
-scene.add(podium);
+scene.add(makePodium());
 
-// ---------- Floating "TV screen" cube ----------
-
-const { tvGroup, screenMaterial, screenMesh } = makeTvScreen();
+const { tvGroup } = makeTvScreen();
 scene.add(tvGroup);
 
-// ---------- Local players (same-keyboard multiplayer) ----------
+// ---------- Voice chat microphone (used inside online rooms) ----------
 
-const players = [
-  { name: 'Jogador 1', color: 0xff2ec4, x: -2.6, avatar: null, velocityY: 0, hopY: 0 },
-  { name: 'Jogador 2', color: 0x2ec4ff, x: 2.6, avatar: null, velocityY: 0, hopY: 0 },
-];
-
-players.forEach((player) => {
-  const avatar = makeAvatar(player.color, player.name);
-  avatar.position.set(player.x, 0, 2.4);
-  scene.add(avatar);
-  player.avatar = avatar;
-});
-
-let activePlayerIndex = 0;
-
-const turnRing = new THREE.Mesh(
-  new THREE.RingGeometry(0.55, 0.7, 32),
-  new THREE.MeshBasicMaterial({
-    color: 0xffffff,
-    transparent: true,
-    opacity: 0.9,
-    side: THREE.DoubleSide,
-  })
-);
-turnRing.rotation.x = -Math.PI / 2;
-scene.add(turnRing);
-
-const turnIndicatorEl = document.getElementById('turn-indicator');
-
-function setActivePlayer(index) {
-  activePlayerIndex = index;
-  const player = players[activePlayerIndex];
-  turnIndicatorEl.textContent = `${player.name} na vez`;
-  turnRing.material.color.set(player.color);
-}
-setActivePlayer(0);
-
-window.addEventListener('keydown', (event) => {
-  if (event.key === '1') setActivePlayer(0);
-  if (event.key === '2') setActivePlayer(1);
-});
-
-// ---------- Microphone volume detection (Web Audio API) ----------
-
-const JUMP_IMPULSE = 3.2;
-const GRAVITY = 14;
 const SPEAK_THRESHOLD = 0.09;
 
-const micBtn = document.getElementById('mic-btn');
-const volumeFillEl = document.getElementById('volume-fill');
+const voiceMicBtn = document.getElementById('voice-mic-btn');
 
 let analyser = null;
 let audioDataArray = null;
-let currentVolume = 0;
+let wasSelfSpeaking = false;
 
-micBtn.addEventListener('click', async () => {
+voiceMicBtn.addEventListener('click', async () => {
   if (analyser) return;
   try {
-    micBtn.textContent = 'Conectando...';
+    voiceMicBtn.textContent = 'Conectando...';
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const source = audioCtx.createMediaStreamSource(stream);
@@ -138,10 +89,10 @@ micBtn.addEventListener('click', async () => {
 
     setLocalStream(stream);
 
-    micBtn.textContent = '🎤 Microfone ativo';
-    micBtn.classList.add('active');
-  } catch (err) {
-    micBtn.textContent = '🎤 Permissão negada';
+    voiceMicBtn.textContent = '🎤 Microfone ativo';
+    voiceMicBtn.classList.add('active');
+  } catch {
+    voiceMicBtn.textContent = '🎤 Permissão negada';
   }
 });
 
@@ -156,107 +107,30 @@ function readMicVolume() {
   return Math.sqrt(sumSquares / audioDataArray.length);
 }
 
-// ---------- Video upload -> VideoTexture ----------
-
-const clipInput = document.getElementById('clip-input');
-const clipLibrarySelect = document.getElementById('clip-library-select');
-const uploadStatus = document.getElementById('upload-status');
-let currentVideo = null;
-let currentVideoUrl = null;
-// O menu principal começa aberto; nenhum vídeo/áudio deve tocar por trás
-// dele até o jogador efetivamente entrar no jogo (ver dismissMenu/openMenu).
-let isMenuOpen = true;
-
-// clipId -> File, so a locally-tagged clip can be replayed automatically
-// when another player in the room broadcasts the same library id.
-const localClipCache = new Map();
-
-PARODY_LIBRARY.forEach((entry) => {
-  const option = document.createElement('option');
-  option.value = entry.id;
-  option.textContent = entry.name;
-  clipLibrarySelect.appendChild(option);
-});
-
-clipInput.addEventListener('change', (event) => {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
-  const clipId = clipLibrarySelect.value;
-  localClipCache.set(clipId, file);
-  playClipFile(file, `Reproduzindo "${file.name}"`);
-  network.notifyClipLoaded(clipId);
-  saveTopbarClip(clipId, file).catch((err) => console.error('Falha ao salvar clipe localmente:', err));
-});
-
-// Recarrega os clipes já enviados anteriormente (guardados no IndexedDB do
-// navegador) para não precisar subi-los de novo a cada visita.
-(async () => {
-  try {
-    const savedClips = await getAllTopbarClips();
-    if (!savedClips.length) return;
-    savedClips.forEach((entry) => localClipCache.set(entry.clipId, entry.blob));
-
-    const currentSelection = clipLibrarySelect.value;
-    const match = savedClips.find((entry) => entry.clipId === currentSelection) || savedClips[0];
-    clipLibrarySelect.value = match.clipId;
-    playClipFile(match.blob, `Reproduzindo "${match.fileName}" (salvo localmente)`);
-  } catch (err) {
-    console.error('Falha ao carregar clipes salvos:', err);
-  }
-})();
-
-function playClipFile(file, playingStatusText) {
-  if (currentVideoUrl) URL.revokeObjectURL(currentVideoUrl);
-  if (currentVideo) currentVideo.pause();
-
-  const video = document.createElement('video');
-  video.loop = true;
-  video.playsInline = true;
-  video.crossOrigin = 'anonymous';
-
-  currentVideoUrl = URL.createObjectURL(file);
-  video.src = currentVideoUrl;
-  currentVideo = video;
-
-  uploadStatus.textContent = `Carregando "${file.name}"…`;
-
-  video.addEventListener('loadeddata', () => {
-    const texture = new THREE.VideoTexture(video);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.minFilter = THREE.LinearFilter;
-    texture.magFilter = THREE.LinearFilter;
-
-    screenMaterial.map = texture;
-    screenMaterial.emissiveMap = texture;
-    screenMaterial.color.set(0xffffff);
-    screenMaterial.emissive.set(0x222222);
-    screenMaterial.needsUpdate = true;
-
-    // Não toca (nem o áudio) enquanto o menu principal estiver aberto por
-    // cima — dismissMenu() retoma quando o jogador realmente entrar no jogo.
-    if (!isMenuOpen) video.play();
-    uploadStatus.textContent = playingStatusText;
-  });
-
-  video.addEventListener('error', () => {
-    uploadStatus.textContent = 'Não foi possível carregar esse clipe.';
-  });
-}
-
 // ---------- Online rooms (Socket.io) ----------
 
+const onlineRoomOverlay = document.getElementById('online-room-overlay');
+const onlineLeaveBtn = document.getElementById('online-leave-btn');
+
 const network = initNetwork({
-  onPlayRemoteClip(clipId, clipName) {
-    const cachedFile = localClipCache.get(clipId);
-    if (cachedFile) {
-      playClipFile(cachedFile, `Acompanhando: "${clipName}"`);
-    } else {
-      uploadStatus.textContent = `Outro jogador está usando "${clipName}" — carregue esse clipe para acompanhar.`;
-    }
-  },
   onJoinedRoom() {
-    dismissMenu();
+    onlineRoomOverlay.classList.remove('menu-hidden');
   },
+});
+
+onlineLeaveBtn.addEventListener('click', () => {
+  network.leaveRoom();
+  onlineRoomOverlay.classList.add('menu-hidden');
+});
+
+// A partida em si abre por cima da sala (mesmo z-index de overlay) — some
+// a sala enquanto ela estiver aberta, e volta a mostrá-la quando o jogador
+// fecha a partida e cai de novo no lobby.
+document.getElementById('online-game-btn').addEventListener('click', () => {
+  onlineRoomOverlay.classList.add('menu-hidden');
+});
+document.getElementById('online-game-overlay').addEventListener('click', (event) => {
+  if (event.target.closest('#og-close-btn')) onlineRoomOverlay.classList.remove('menu-hidden');
 });
 
 // ---------- Online multiplayer game (rounds over the same room) ----------
@@ -270,40 +144,14 @@ initWebRTC({
   onFileReceived: onlineGame?.handleFileReceived,
   onFileProgress: onlineGame?.handleFileProgress,
 });
-let wasSelfSpeaking = false;
 
 // ---------- Main menu ----------
 
-const mainMenuEl = document.getElementById('main-menu');
-const playLocalBtn = document.getElementById('play-local-btn');
 const toggleOnlineBtn = document.getElementById('toggle-online-btn');
 const menuOnlineForm = document.getElementById('menu-online-form');
 const howToPlayToggle = document.getElementById('how-to-play-toggle');
 const howToPlayList = document.getElementById('how-to-play');
-const menuBtn = document.getElementById('menu-btn');
-const backToGameBtn = document.getElementById('back-to-game-btn');
 const menuGalleryBtn = document.getElementById('menu-gallery-btn');
-
-let gameStarted = false;
-
-function dismissMenu() {
-  gameStarted = true;
-  isMenuOpen = false;
-  mainMenuEl.classList.add('menu-hidden');
-  backToGameBtn.hidden = false;
-  currentVideo?.play().catch(() => {});
-}
-
-function openMenu() {
-  isMenuOpen = true;
-  mainMenuEl.classList.remove('menu-hidden');
-  backToGameBtn.hidden = !gameStarted;
-  currentVideo?.pause();
-}
-
-playLocalBtn.addEventListener('click', dismissMenu);
-backToGameBtn.addEventListener('click', dismissMenu);
-menuBtn.addEventListener('click', openMenu);
 
 toggleOnlineBtn.addEventListener('click', () => {
   menuOnlineForm.hidden = !menuOnlineForm.hidden;
@@ -314,12 +162,11 @@ howToPlayToggle.addEventListener('click', () => {
   howToPlayToggle.textContent = howToPlayList.hidden ? 'Como jogar ▾' : 'Como jogar ▴';
 });
 
-menuGalleryBtn.addEventListener('click', () => {
-  dismissMenu();
-  openGallery();
-});
+menuGalleryBtn.addEventListener('click', () => openGallery());
 
 // ---------- Modo Solo / Multiplayer Local ----------
+// (Abrem como overlays por cima do menu — o menu principal nunca precisa
+// ser escondido pra esses dois, só a sala online tem uma tela própria.)
 
 initSoloMode({ openBtnId: 'solo-mode-btn', overlayId: 'solo-overlay' });
 initMultiplayerMode({ openBtnId: 'multiplayer-mode-btn', overlayId: 'multiplayer-overlay' });
@@ -327,12 +174,9 @@ initMultiplayerMode({ openBtnId: 'multiplayer-mode-btn', overlayId: 'multiplayer
 // ---------- Animation loop ----------
 
 const clock = new THREE.Clock();
-let lastTime = 0;
 
 function animate() {
   const t = clock.getElapsedTime();
-  const dt = Math.min(t - lastTime, 0.05);
-  lastTime = t;
 
   tvGroup.position.y = 3.4 + Math.sin(t * 0.9) * 0.15;
   tvGroup.rotation.y = Math.sin(t * 0.35) * 0.08;
@@ -340,38 +184,13 @@ function animate() {
   pinkLight.intensity = 5 + Math.sin(t * 2) * 1.5;
   blueLight.intensity = 5 + Math.cos(t * 2.3) * 1.5;
 
-  currentVolume = readMicVolume();
-  volumeFillEl.style.width = `${Math.min(currentVolume / 0.4, 1) * 100}%`;
-
-  const isSpeaking = analyser && currentVolume > SPEAK_THRESHOLD;
-  if (socket.id && isSpeaking !== wasSelfSpeaking) {
-    wasSelfSpeaking = isSpeaking;
-    network.setPeerTalking(socket.id, isSpeaking);
+  if (analyser) {
+    const isSpeaking = readMicVolume() > SPEAK_THRESHOLD;
+    if (socket.id && isSpeaking !== wasSelfSpeaking) {
+      wasSelfSpeaking = isSpeaking;
+      network.setPeerTalking(socket.id, isSpeaking);
+    }
   }
-  const activePlayer = players[activePlayerIndex];
-
-  players.forEach((player) => {
-    const isActive = player === activePlayer;
-
-    if (isActive && isSpeaking && player.hopY <= 0.001) {
-      player.velocityY = JUMP_IMPULSE;
-    }
-
-    player.velocityY -= GRAVITY * dt;
-    player.hopY = Math.max(0, player.hopY + player.velocityY * dt);
-    if (player.hopY <= 0) {
-      player.hopY = 0;
-      player.velocityY = 0;
-    }
-
-    player.avatar.position.y = player.hopY;
-    player.avatar.scale.y = isActive ? 1 + player.hopY * 0.15 : 1;
-
-    const glow = isActive ? (isSpeaking ? 1.4 : 0.7) : 0.25;
-    player.avatar.userData.setGlow(glow);
-  });
-
-  turnRing.position.set(activePlayer.x, 0.02, 2.4);
 
   controls.update();
   renderer.render(scene, camera);
@@ -469,62 +288,6 @@ function makePodium() {
   return group;
 }
 
-function makeAvatar(color, label) {
-  const group = new THREE.Group();
-
-  const bodyMaterial = new THREE.MeshStandardMaterial({
-    color,
-    emissive: color,
-    emissiveIntensity: 0.25,
-    roughness: 0.4,
-    metalness: 0.3,
-  });
-
-  const body = new THREE.Mesh(
-    new THREE.CapsuleGeometry(0.35, 0.7, 6, 12),
-    bodyMaterial
-  );
-  body.position.y = 0.75;
-
-  const head = new THREE.Mesh(
-    new THREE.SphereGeometry(0.3, 16, 16),
-    bodyMaterial
-  );
-  head.position.y = 1.4;
-
-  const labelSprite = makeTextSprite(label);
-  labelSprite.position.y = 1.95;
-
-  group.add(body, head, labelSprite);
-  group.userData.setGlow = (intensity) => {
-    bodyMaterial.emissiveIntensity = intensity;
-  };
-
-  return group;
-}
-
-function makeTextSprite(text) {
-  const canvasEl = document.createElement('canvas');
-  canvasEl.width = 256;
-  canvasEl.height = 64;
-  const ctx = canvasEl.getContext('2d');
-  ctx.fillStyle = 'rgba(10, 0, 20, 0.6)';
-  ctx.roundRect(0, 0, 256, 64, 16);
-  ctx.fill();
-  ctx.font = 'bold 32px Segoe UI, sans-serif';
-  ctx.fillStyle = '#ffffff';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, 128, 34);
-
-  const texture = new THREE.CanvasTexture(canvasEl);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  const material = new THREE.SpriteMaterial({ map: texture, depthWrite: false });
-  const sprite = new THREE.Sprite(material);
-  sprite.scale.set(1.4, 0.35, 1);
-  return sprite;
-}
-
 function makeTvScreen() {
   const tvGroup = new THREE.Group();
   tvGroup.position.set(0, 3.4, -3);
@@ -540,16 +303,14 @@ function makeTvScreen() {
     })
   );
 
-  const screenMaterial = new THREE.MeshStandardMaterial({
-    color: 0x050510,
-    emissive: 0x0a0a2a,
-    emissiveIntensity: 1,
-    roughness: 0.4,
-  });
-
   const screenMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(4.0, 2.2),
-    screenMaterial
+    new THREE.MeshStandardMaterial({
+      color: 0x050510,
+      emissive: 0x0a0a2a,
+      emissiveIntensity: 1,
+      roughness: 0.4,
+    })
   );
   screenMesh.position.z = 0.16;
 
@@ -566,5 +327,5 @@ function makeTvScreen() {
 
   tvGroup.add(frame, screenMesh, rim);
 
-  return { tvGroup, screenMaterial, screenMesh };
+  return { tvGroup };
 }

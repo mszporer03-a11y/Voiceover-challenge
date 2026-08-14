@@ -10,41 +10,6 @@
     <div id="app">
       <canvas id="scene"></canvas>
 
-      <div id="hud">
-        <div id="top-controls">
-          <button id="menu-btn" type="button" title="Abrir menu">🏠 Menu</button>
-
-          <select id="clip-library-select" title="A qual clipe da biblioteca este arquivo corresponde?"></select>
-
-          <label id="upload-btn" for="clip-input">
-            🎬 Carregar clipe (.mp4 / .webm)
-            <input id="clip-input" type="file" accept=".mp4,.webm,video/mp4,video/webm" hidden />
-          </label>
-
-          <button id="mic-btn" type="button">🎤 Ativar microfone</button>
-          <button id="solo-mode-btn" type="button">🎮 Modo Solo</button>
-          <button id="multiplayer-mode-btn" type="button">👥 Multiplayer Local</button>
-        </div>
-
-        <div id="upload-status"></div>
-
-        <div id="player-panel">
-          <div id="turn-indicator">Jogador 1 na vez</div>
-          <div id="volume-meter"><div id="volume-fill"></div></div>
-          <div id="controls-hint">Pressione <kbd>1</kbd> ou <kbd>2</kbd> para trocar de jogador</div>
-        </div>
-
-        <div id="online-panel" hidden>
-          <div id="online-panel-title">Sala Online</div>
-          <div id="online-room-info">
-            <span id="room-code-display"></span>
-            <span id="online-state-badge"></span>
-          </div>
-          <ul id="online-player-list"></ul>
-          <button id="online-game-btn" class="menu-btn-secondary" type="button">🎮 Abrir partida</button>
-        </div>
-      </div>
-
       <div id="main-menu">
         <div class="menu-backdrop"></div>
 
@@ -54,14 +19,9 @@
 
           <div class="menu-section">
             <input id="player-name-input" type="text" placeholder="Seu nome de palco" maxlength="16" />
-
-            <button id="play-local-btn" class="menu-btn-primary" type="button">
-              🎮 Jogar agora (local)
-            </button>
-
-            <button id="toggle-online-btn" class="menu-btn-secondary" type="button">
-              🌐 Jogar online com amigos
-            </button>
+            <button id="solo-mode-btn" class="menu-btn-primary" type="button">🎮 Modo Solo</button>
+            <button id="multiplayer-mode-btn" class="menu-btn-secondary" type="button">👥 Multiplayer Local</button>
+            <button id="toggle-online-btn" class="menu-btn-secondary" type="button">🌐 Jogar online com amigos</button>
           </div>
 
           <div id="menu-online-form" class="menu-section menu-online-form" hidden>
@@ -76,13 +36,28 @@
           <button id="menu-gallery-btn" class="menu-link" type="button">🎬 Galeria de clipes</button>
           <button id="how-to-play-toggle" class="menu-link" type="button">Como jogar ▾</button>
           <ul id="how-to-play" class="how-to-play" hidden>
-            <li>🎬 Carregue um clipe de vídeo local ou combine um da biblioteca de paródias.</li>
-            <li>🎤 Ative o microfone e dublem por cima do clipe em tempo real.</li>
-            <li>🕺 Quem estiver falando faz o avatar pular no palco — todo mundo vê quem está "no ar".</li>
-            <li>🏆 Alternem turnos, votem nas melhores dublagens e riam da paródia.</li>
+            <li>🎮 Modo Solo: escolha um clipe da galeria e dublone sozinho, fala por fala.</li>
+            <li>👥 Multiplayer Local: revezem no mesmo aparelho, cada um dublando seu trecho.</li>
+            <li>🌐 Online: crie ou entre numa sala pra jogar com amigos à distância, com chat de voz.</li>
+            <li>🏆 No final, votem nas melhores dublagens e riam da paródia.</li>
           </ul>
+        </div>
+      </div>
 
-          <button id="back-to-game-btn" class="menu-link" type="button" hidden>◀ Voltar para o jogo</button>
+      <div id="online-room-overlay" class="dub-overlay menu-hidden">
+        <div class="menu-backdrop"></div>
+        <div id="online-panel" class="menu-card">
+          <h2 class="menu-logo" style="font-size: 22px">SALA ONLINE</h2>
+          <div id="online-room-info">
+            <span id="room-code-display"></span>
+            <span id="online-state-badge"></span>
+          </div>
+          <ul id="online-player-list"></ul>
+          <div class="menu-section">
+            <button id="voice-mic-btn" class="menu-btn-secondary" type="button">🎤 Ativar microfone</button>
+            <button id="online-game-btn" class="menu-btn-primary" type="button">🎮 Abrir partida</button>
+            <button id="online-leave-btn" class="menu-link" type="button">◀ Sair da sala</button>
+          </div>
         </div>
       </div>
 

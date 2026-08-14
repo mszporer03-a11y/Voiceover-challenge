@@ -1,5 +1,4 @@
 import { socket, connectSocket } from './socket.js';
-import { PARODY_LIBRARY } from './library.js';
 
 const GAME_STATE_LABELS = {
   LOBBY: 'Esperando',
@@ -9,14 +8,13 @@ const GAME_STATE_LABELS = {
   RESULTS: 'Resultado',
 };
 
-export function initNetwork({ onPlayRemoteClip, onJoinedRoom }) {
+export function initNetwork({ onJoinedRoom }) {
   const el = {
     nameInput: document.getElementById('player-name-input'),
     roomInput: document.getElementById('room-code-input'),
     createBtn: document.getElementById('create-room-btn'),
     joinBtn: document.getElementById('join-room-btn'),
     status: document.getElementById('online-status'),
-    panel: document.getElementById('online-panel'),
     roomCode: document.getElementById('room-code-display'),
     playerList: document.getElementById('online-player-list'),
     stateBadge: document.getElementById('online-state-badge'),
@@ -26,6 +24,13 @@ export function initNetwork({ onPlayRemoteClip, onJoinedRoom }) {
 
   function setStatus(text) {
     el.status.textContent = text;
+  }
+
+  function resetRoomUI() {
+    roomId = null;
+    el.roomCode.textContent = '';
+    el.stateBadge.textContent = '';
+    el.playerList.innerHTML = '';
   }
 
   function renderRoom(snapshot) {
@@ -54,7 +59,6 @@ export function initNetwork({ onPlayRemoteClip, onJoinedRoom }) {
     }
     roomId = response.roomId;
     setStatus('Conectado.');
-    el.panel.hidden = false;
     renderRoom(response);
     onJoinedRoom?.(roomId);
   }
@@ -86,26 +90,25 @@ export function initNetwork({ onPlayRemoteClip, onJoinedRoom }) {
 
   socket.on('room-update', renderRoom);
 
-  socket.on('play-clip', (clipMeta) => {
-    const entry = PARODY_LIBRARY.find((c) => c.id === clipMeta.id);
-    onPlayRemoteClip(clipMeta.id, entry?.name || clipMeta.id);
-  });
-
   socket.on('disconnect', () => {
     setStatus('Desconectado do servidor.');
   });
 
   return {
-    notifyClipLoaded(clipId) {
-      if (!roomId || !socket.connected) return;
-      socket.emit('clip-loaded', { id: clipId });
-    },
     isInRoom() {
       return !!roomId;
     },
     setPeerTalking(peerId, talking) {
       const li = el.playerList.querySelector(`li[data-peer-id="${peerId}"]`);
       li?.querySelector('.mic-dot')?.classList.toggle('talking', talking);
+    },
+    // Desconecta manualmente (socket.io não tenta reconectar sozinho depois
+    // de um disconnect() explícito do cliente) e limpa o estado da sala, pra
+    // dar pra sair de uma sala sem precisar recarregar a página.
+    leaveRoom() {
+      if (socket.connected) socket.disconnect();
+      resetRoomUI();
+      setStatus('');
     },
   };
 }

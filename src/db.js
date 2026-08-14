@@ -4,7 +4,6 @@
 const DB_NAME = 'voiceover-challenge';
 const DB_VERSION = 2;
 const STORE_NAME = 'clips';
-const TOPBAR_STORE_NAME = 'topbarClips';
 
 let dbPromise = null;
 
@@ -16,9 +15,6 @@ function openDb() {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains(TOPBAR_STORE_NAME)) {
-        db.createObjectStore(TOPBAR_STORE_NAME, { keyPath: 'clipId' });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -73,23 +69,4 @@ export async function updateClip(id, patch) {
 
 export async function deleteClip(id) {
   await withStore(STORE_NAME, 'readwrite', (store) => store.delete(id));
-}
-
-// ---------- Clipes da barra superior (upload rápido, sem tagging) ----------
-// Guardados por clipId da biblioteca de paródias, para reaparecerem
-// automaticamente da próxima vez que o site for aberto.
-
-export async function saveTopbarClip(clipId, file) {
-  const record = { clipId, fileName: file.name, blob: file, updatedAt: Date.now() };
-  await withStore(TOPBAR_STORE_NAME, 'readwrite', (store) => store.put(record));
-  return record;
-}
-
-export async function getAllTopbarClips() {
-  const clips = await withStore(TOPBAR_STORE_NAME, 'readonly', (store) => store.getAll());
-  return clips.sort((a, b) => b.updatedAt - a.updatedAt);
-}
-
-export async function deleteTopbarClip(clipId) {
-  await withStore(TOPBAR_STORE_NAME, 'readwrite', (store) => store.delete(clipId));
 }

@@ -318,14 +318,6 @@ io.on('connection', (socket) => {
     broadcastRoom(currentRoomId);
   });
 
-  // A player loaded a local clip that matches an entry in the shared
-  // "biblioteca de paródias". Broadcast the clip id so every other client
-  // plays its own pre-loaded copy of that same clip.
-  socket.on('clip-loaded', (clipMeta) => {
-    if (!currentRoomId) return;
-    socket.to(currentRoomId).emit('play-clip', { from: socket.id, ...clipMeta });
-  });
-
   // Opaque WebRTC signaling relay (SDP offers/answers + ICE candidates).
   // The server never inspects the payload, it just forwards it to the
   // intended peer so two clients in the same room can negotiate a direct
