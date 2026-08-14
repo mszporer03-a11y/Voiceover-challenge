@@ -245,8 +245,17 @@ html, body, #app {
 }
 
 .menu-online-form {
-  padding-top: 4px;
+  padding-top: 14px;
   border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.menu-section-label {
+  color: #9df;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  opacity: 0.8;
 }
 
 .menu-join-row {

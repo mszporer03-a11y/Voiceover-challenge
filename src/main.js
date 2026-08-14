@@ -147,15 +147,9 @@ initWebRTC({
 
 // ---------- Main menu ----------
 
-const toggleOnlineBtn = document.getElementById('toggle-online-btn');
-const menuOnlineForm = document.getElementById('menu-online-form');
 const howToPlayToggle = document.getElementById('how-to-play-toggle');
 const howToPlayList = document.getElementById('how-to-play');
 const menuGalleryBtn = document.getElementById('menu-gallery-btn');
-
-toggleOnlineBtn.addEventListener('click', () => {
-  menuOnlineForm.hidden = !menuOnlineForm.hidden;
-});
 
 howToPlayToggle.addEventListener('click', () => {
   howToPlayList.hidden = !howToPlayList.hidden;
