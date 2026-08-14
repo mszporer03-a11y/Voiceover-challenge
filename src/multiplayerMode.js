@@ -1,4 +1,4 @@
-import { getAllClips, getRandomClip } from './db.js';
+import { getAllClips } from './db.js';
 import {
   createResources,
   renderGalleryScreen,
@@ -7,6 +7,7 @@ import {
   renderResultScreen,
   formatTime,
   el,
+  getRandomAnyClip,
 } from './dubShared.js';
 
 // Multiplayer local (mesmo aparelho, sem servidor): 3 modos que reaproveitam
@@ -175,12 +176,12 @@ function openManageGallery() {
 
 async function startGame(modeId, players, clips) {
   if (modeId === 'coop') {
-    const clip = await getRandomClip();
+    const clip = await getRandomAnyClip();
     if (clip) runCoopMode(clip, players);
     return;
   }
   if (modeId === 'same-clip') {
-    const clip = await getRandomClip();
+    const clip = await getRandomAnyClip();
     if (clip) runSequentialDubbing(players, () => clip);
     return;
   }

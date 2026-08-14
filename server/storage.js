@@ -124,7 +124,14 @@ export async function uploadAndRegisterClip({ hash, ext, buffer, contentType, na
   return withLock(async () => {
     const list = await readIndex();
     const existing = list.find((c) => c.hash === hash);
-    if (existing) return existing; // já enviado antes (dedupe por hash)
+    if (existing) {
+      // Mesmo vídeo já está lá (dedupe por hash) — não reenvia o binário,
+      // mas atualiza nome/falas/personagens, já que quem chamou pode ter
+      // editado as tags depois do primeiro envio.
+      Object.assign(existing, { name, durationSec, segments, characters, updatedAt: Date.now() });
+      await writeIndex(list);
+      return existing;
+    }
 
     const file = new UTFile([buffer], `${hash}.${ext}`, { type: contentType, customId: hash });
     const { data, error } = await utapi.uploadFiles(file);

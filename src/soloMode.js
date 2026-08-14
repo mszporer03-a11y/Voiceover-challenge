@@ -1,10 +1,10 @@
-import { getRandomClip } from './db.js';
 import {
   createResources,
   renderGalleryScreen,
   renderViewOriginalScreen,
   runGuidedRecording,
   renderResultScreen,
+  getRandomAnyClip,
 } from './dubShared.js';
 
 // Controlador de tela cheia do Modo Solo: galeria -> ver clipe original ->
@@ -56,7 +56,7 @@ function renderGallery() {
       {
         label: '🎲 Sortear e jogar',
         onClick: async () => {
-          const clip = await getRandomClip();
+          const clip = await getRandomAnyClip();
           if (clip) renderViewOriginal(clip);
         },
       },
@@ -89,7 +89,7 @@ function renderResult(clip, recordings) {
       {
         label: '🎲 Jogar outro clipe',
         onClick: async () => {
-          const next = await getRandomClip();
+          const next = await getRandomAnyClip();
           if (next) renderViewOriginal(next);
           else renderGallery();
         },

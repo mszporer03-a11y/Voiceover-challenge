@@ -112,6 +112,61 @@ export function createResources() {
 
 // ---------- Galeria (listar / adicionar / remover clipes) ----------
 
+// Junta clipes locais (IndexedDB) com clipes compartilhados na nuvem que
+// este aparelho ainda não baixou, numa lista só — não existe mais "galeria
+// local" vs. "galeria da nuvem": todo clipe aparece uma vez, é jogável, e
+// entra no sorteio aleatório (baixando sob demanda se só existir na nuvem).
+export async function getMergedGalleryClips() {
+  const localClips = await getAllClips();
+  let cloudClips = [];
+  try {
+    cloudClips = await listCloudClips();
+  } catch {
+    // nuvem não configurada ou indisponível — segue só com os locais
+  }
+  const localHashes = new Set(localClips.map((c) => c.cloudHash).filter(Boolean));
+  const merged = localClips.map((clip) => ({ kind: 'local', clip, sortAt: clip.createdAt }));
+  cloudClips.forEach((entry) => {
+    if (localHashes.has(entry.hash)) return; // já tem cópia local, não duplica
+    merged.push({ kind: 'cloud', entry, sortAt: entry.updatedAt });
+  });
+  merged.sort((a, b) => b.sortAt - a.sortAt);
+  return merged;
+}
+
+// Garante que um item da lista combinada vire um clipe local de verdade
+// (baixando da nuvem e salvando no IndexedDB se ainda for só uma entrada
+// remota) — usado tanto ao clicar em "Jogar"/"Editar" quanto no sorteio.
+async function resolveMergedClip(item) {
+  if (item.kind === 'local') return item.clip;
+  const entry = item.entry;
+  const videoBlob = await fetchCloudClipBlob(entry.url);
+  const video = document.createElement('video');
+  video.src = URL.createObjectURL(videoBlob);
+  await new Promise((resolve) => video.addEventListener('loadedmetadata', resolve, { once: true }));
+  const thumbnailDataUrl = await captureThumbnail(video);
+  URL.revokeObjectURL(video.src);
+  return addClip({
+    name: entry.name,
+    videoBlob,
+    thumbnailDataUrl,
+    durationSec: entry.durationSec || video.duration,
+    segments: entry.segments,
+    characters: entry.characters || [],
+    cloudHash: entry.hash,
+    cloudUrl: entry.url,
+  });
+}
+
+/** Sorteia um clipe entre TODOS os disponíveis — locais e da nuvem ainda não
+ * baixados neste aparelho — baixando-o primeiro se for preciso. */
+export async function getRandomAnyClip() {
+  const merged = await getMergedGalleryClips();
+  if (!merged.length) return null;
+  const pick = merged[Math.floor(Math.random() * merged.length)];
+  return resolveMergedClip(pick);
+}
+
 export async function renderGalleryScreen(cardEl, resources, opts = {}) {
   const { title, tagline, onPick, onClose, pickLabel, closeLabel, extraButtons = [] } = opts;
 
@@ -130,11 +185,6 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
         .join('')}
       ${onClose ? `<button id="dub-gallery-close-btn" class="menu-link" type="button">${closeLabel ?? 'Fechar'}</button>` : ''}
     </div>
-    <div id="dub-cloud-section" hidden>
-      <h3 class="menu-logo" style="font-size:16px; margin-top:14px;">☁ GALERIA DA NUVEM</h3>
-      <p class="menu-tagline" style="margin-bottom:-4px;">Clipes salvos por qualquer jogador, disponíveis em qualquer aparelho</p>
-      <div id="dub-cloud-grid" class="solo-gallery-grid"><p class="menu-status">Carregando…</p></div>
-    </div>
   `;
 
   const refresh = () => renderGalleryScreen(cardEl, resources, opts);
@@ -152,144 +202,85 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
     }
   });
 
-  const clips = await getAllClips();
+  const items = await getMergedGalleryClips();
   const grid = cardEl.querySelector('#dub-gallery-grid');
   if (!grid) return; // tela já mudou enquanto carregava
 
   extraButtons.forEach((b, i) => {
     const btn = cardEl.querySelector(`#dub-gallery-extra-${i}`);
-    if (btn) btn.disabled = clips.length === 0;
+    if (btn) btn.disabled = items.length === 0;
   });
 
-  if (!clips.length) {
+  if (!items.length) {
     grid.innerHTML = `<p class="menu-status">Nenhum clipe na galeria ainda. Adicione um pra começar!</p>`;
-    loadCloudGrid(cardEl, resources, { pickLabel, onPick, refresh });
     return;
   }
 
   grid.innerHTML = '';
-  clips.forEach((clip) => {
-    const shareLabel = clip.cloudUrl ? '☁ Compartilhado' : '☁ Compartilhar';
+  items.forEach((item) => {
+    const isLocal = item.kind === 'local';
+    const data = isLocal ? item.clip : item.entry;
+    const characterCount = (data.characters || []).length;
+    const segmentCount = (data.segments || []).length;
     const card = el(`
       <div class="solo-clip-card">
-        <img src="${clip.thumbnailDataUrl}" alt="${clip.name}" />
-        <div class="solo-clip-name">${clip.name}</div>
-        <div class="solo-clip-meta">${clip.characters.length} personagem(ns) · ${clip.segments.length} fala(s)</div>
+        ${
+          isLocal
+            ? `<img src="${data.thumbnailDataUrl}" alt="${data.name}" />`
+            : `<div class="solo-clip-thumb-placeholder" title="Ainda só na nuvem — baixa ao jogar/editar">☁</div>`
+        }
+        <div class="solo-clip-name">${data.name}</div>
+        <div class="solo-clip-meta">${characterCount} personagem(ns) · ${segmentCount} fala(s)</div>
         <div class="solo-clip-actions">
           <button class="menu-btn-secondary solo-clip-play" type="button">${pickLabel ?? '▶ Jogar'}</button>
           <button class="menu-link solo-clip-edit" type="button">✏ Editar falas</button>
-          <button class="menu-link solo-clip-share" type="button" ${clip.cloudUrl ? 'disabled' : ''}>${shareLabel}</button>
-          <button class="menu-link solo-clip-delete" type="button">Remover</button>
+          <button class="menu-link solo-clip-delete" type="button">${isLocal ? 'Remover' : 'Remover da nuvem'}</button>
         </div>
       </div>
     `);
-    card.querySelector('.solo-clip-play').addEventListener('click', () => onPick?.(clip));
-    card.querySelector('.solo-clip-edit').addEventListener('click', () => {
-      renderEditTaggingScreen(cardEl, resources, clip, { onSaved: refresh, onCancel: refresh });
-    });
-    card.querySelector('.solo-clip-share').addEventListener('click', async (e) => {
-      const btn = e.currentTarget;
-      btn.disabled = true;
-      btn.textContent = '☁ Enviando…';
+
+    const playBtn = card.querySelector('.solo-clip-play');
+    const editBtn = card.querySelector('.solo-clip-edit');
+    const deleteBtn = card.querySelector('.solo-clip-delete');
+    const playLabel = playBtn.textContent;
+
+    // Clipes só-na-nuvem baixam (e salvam localmente) na hora, tanto pra
+    // jogar quanto pra editar — não existe mais um botão "Baixar" à parte.
+    async function withDownload(run) {
+      playBtn.disabled = true;
+      editBtn.disabled = true;
+      if (!isLocal) playBtn.textContent = '⬇ Baixando…';
       try {
-        const entry = await uploadClipToCloud(clip, (p) => {
-          btn.textContent = `☁ Enviando… ${Math.round(p * 100)}%`;
-        });
-        await updateClip(clip.id, { cloudHash: entry.hash, cloudUrl: entry.url });
-        refresh();
+        const clip = await resolveMergedClip(item);
+        run(clip);
       } catch (err) {
-        btn.disabled = false;
-        btn.textContent = shareLabel;
-        alert(`Não foi possível compartilhar: ${err.message}`);
+        alert(`Falha ao baixar clipe: ${err.message}`);
+      } finally {
+        playBtn.disabled = false;
+        editBtn.disabled = false;
+        playBtn.textContent = playLabel;
       }
-    });
-    card.querySelector('.solo-clip-delete').addEventListener('click', async () => {
-      await deleteClip(clip.id);
+    }
+
+    playBtn.addEventListener('click', () => withDownload((clip) => onPick?.(clip)));
+    editBtn.addEventListener('click', () =>
+      withDownload((clip) => renderEditTaggingScreen(cardEl, resources, clip, { onSaved: refresh, onCancel: refresh }))
+    );
+    deleteBtn.addEventListener('click', async () => {
+      if (isLocal) {
+        await deleteClip(data.id);
+      } else {
+        if (!confirm(`Remover "${data.name}" da nuvem?`)) return;
+        try {
+          await deleteCloudClip(data.hash);
+        } catch (err) {
+          alert(`Falha ao remover: ${err.message}`);
+          return;
+        }
+      }
       refresh();
     });
-    grid.appendChild(card);
-  });
 
-  loadCloudGrid(cardEl, resources, { pickLabel, onPick, refresh });
-}
-
-async function loadCloudGrid(cardEl, resources, { pickLabel, onPick, refresh }) {
-  const section = cardEl.querySelector('#dub-cloud-section');
-  const grid = cardEl.querySelector('#dub-cloud-grid');
-  if (!section || !grid) return;
-
-  let cloudClips;
-  try {
-    cloudClips = await listCloudClips();
-  } catch {
-    return; // nuvem não configurada ou indisponível — some sem incomodar
-  }
-  if (!cardEl.querySelector('#dub-cloud-grid')) return; // tela já mudou
-
-  section.hidden = false;
-  if (!cloudClips.length) {
-    grid.innerHTML = `<p class="menu-status">Nenhum clipe compartilhado ainda.</p>`;
-    return;
-  }
-
-  const localClips = await getAllClips();
-  const localHashes = new Set(localClips.map((c) => c.cloudHash).filter(Boolean));
-
-  grid.innerHTML = '';
-  cloudClips.forEach((entry) => {
-    const alreadyLocal = localHashes.has(entry.hash);
-    const card = el(`
-      <div class="solo-clip-card">
-        <div class="solo-clip-name">${entry.name}</div>
-        <div class="solo-clip-meta">${(entry.characters || []).length} personagem(ns) · ${(entry.segments || []).length} fala(s) · ${((entry.sizeBytes || 0) / 1e6).toFixed(1)}MB</div>
-        <div class="solo-clip-actions">
-          <button class="menu-btn-secondary cloud-clip-get" type="button">${alreadyLocal ? (pickLabel ?? '▶ Jogar') : '⬇ Baixar'}</button>
-          <button class="menu-link cloud-clip-delete" type="button">Remover da nuvem</button>
-        </div>
-      </div>
-    `);
-    card.querySelector('.cloud-clip-get').addEventListener('click', async (e) => {
-      if (alreadyLocal) {
-        onPick?.(localClips.find((c) => c.cloudHash === entry.hash));
-        return;
-      }
-      const btn = e.currentTarget;
-      btn.disabled = true;
-      btn.textContent = '⬇ Baixando…';
-      try {
-        const videoBlob = await fetchCloudClipBlob(entry.url);
-        const video = document.createElement('video');
-        video.src = URL.createObjectURL(videoBlob);
-        await new Promise((resolve) => video.addEventListener('loadedmetadata', resolve, { once: true }));
-        const thumbnailDataUrl = await captureThumbnail(video);
-        URL.revokeObjectURL(video.src);
-        const saved = await addClip({
-          name: entry.name,
-          videoBlob,
-          thumbnailDataUrl,
-          durationSec: entry.durationSec || video.duration,
-          segments: entry.segments,
-          characters: entry.characters || [],
-          cloudHash: entry.hash,
-          cloudUrl: entry.url,
-        });
-        if (onPick) onPick(saved);
-        else refresh();
-      } catch (err) {
-        btn.disabled = false;
-        btn.textContent = '⬇ Baixar';
-        alert(`Falha ao baixar: ${err.message}`);
-      }
-    });
-    card.querySelector('.cloud-clip-delete').addEventListener('click', async () => {
-      if (!confirm(`Remover "${entry.name}" da nuvem? Isso não apaga cópias locais já baixadas.`)) return;
-      try {
-        await deleteCloudClip(entry.hash);
-        refresh();
-      } catch (err) {
-        alert(`Falha ao remover: ${err.message}`);
-      }
-    });
     grid.appendChild(card);
   });
 }
@@ -520,8 +511,22 @@ function renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel
       segments: rows.map((r) => ({ id: r.id, start: r.start, end: r.end, character: r.character })),
       characters,
     };
-    if (clipId) await updateClip(clipId, payload);
-    else await addClip(payload);
+    const saved = clipId ? await updateClip(clipId, payload) : await addClip(payload);
+
+    // Todo clipe vai pra galeria da nuvem automaticamente — não existe mais
+    // um passo separado de "compartilhar". Reenviar um clipe já editado
+    // reaproveita o vídeo (dedupe por hash no servidor) e só atualiza as
+    // falas/personagens. Se a nuvem não estiver configurada/disponível, o
+    // clipe segue salvo localmente mesmo assim — isso não deve travar nada.
+    statusEl.textContent = 'Salvo! Enviando pra galeria da nuvem…';
+    try {
+      const entry = await uploadClipToCloud(saved, (p) => {
+        statusEl.textContent = `Salvo! Enviando pra galeria da nuvem… ${Math.round(p * 100)}%`;
+      });
+      await updateClip(saved.id, { cloudHash: entry.hash, cloudUrl: entry.url });
+    } catch (err) {
+      console.error('Falha ao enviar clipe pra nuvem:', err);
+    }
     onSaved?.();
   });
 }

@@ -71,12 +71,6 @@ export async function updateClip(id, patch) {
   return record;
 }
 
-export async function getRandomClip() {
-  const clips = await getAllClips();
-  if (!clips.length) return null;
-  return clips[Math.floor(Math.random() * clips.length)];
-}
-
 export async function deleteClip(id) {
   await withStore(STORE_NAME, 'readwrite', (store) => store.delete(id));
 }
