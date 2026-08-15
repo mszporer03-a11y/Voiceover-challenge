@@ -13,11 +13,14 @@ import { fileURLToPath } from 'url';
 // token (no cloud configured at all, e.g. local dev).
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_PATH = path.join(__dirname, 'data', 'clips-index.json');
-// Fixed customId acting as a "pointer" to the current index file: we always
-// delete the previous one before uploading the next, so at most one file
-// ever holds this customId — a cheap, direct lookup instead of scanning
-// every file in the app to find it.
-const INDEX_CUSTOM_ID = 'clips-index';
+// UploadThing doesn't delete files instantly — a deleted file sits in
+// "Deletion Pending" status for a while before its key/customId is truly
+// free, so uploading a fresh index under the *same* customId right after
+// deleting the old one fails almost every time. Instead, every write gets
+// its own uniquely-named file (never reused), and reads just pick the
+// newest one matching this prefix; stale copies are cleaned up in the
+// background afterwards.
+const INDEX_NAME_PREFIX = 'clips-index-';
 
 export const cloudEnabled = Boolean(process.env.UPLOADTHING_TOKEN);
 
@@ -25,9 +28,19 @@ const utapi = cloudEnabled ? new UTApi() : null;
 
 let indexCache = null;
 
+async function findLatestIndexFile() {
+  const { files } = await utapi.listFiles({ limit: 500 });
+  const candidates = files.filter((f) => f.name.startsWith(INDEX_NAME_PREFIX) && f.status === 'Uploaded');
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.uploadedAt - a.uploadedAt);
+  return candidates[0];
+}
+
 async function loadIndexFromCloud() {
   try {
-    const [entry] = await utapi.getFileUrls(INDEX_CUSTOM_ID, { keyType: 'customId' });
+    const file = await findLatestIndexFile();
+    if (!file) return [];
+    const [entry] = (await utapi.getFileUrls(file.key)).data;
     if (!entry?.url) return [];
     const res = await fetch(entry.url);
     if (!res.ok) return [];
@@ -39,14 +52,20 @@ async function loadIndexFromCloud() {
 }
 
 async function saveIndexToCloud(list) {
-  // Libera o customId de novo (se já existia) antes de subir a versão nova.
-  await utapi.deleteFiles(INDEX_CUSTOM_ID, { keyType: 'customId' }).catch(() => {});
-  const file = new UTFile([JSON.stringify(list)], 'clips-index.json', {
-    type: 'application/json',
-    customId: INDEX_CUSTOM_ID,
-  });
+  const name = `${INDEX_NAME_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const file = new UTFile([JSON.stringify(list)], name, { type: 'application/json' });
   const { error } = await utapi.uploadFiles(file);
   if (error) throw new Error(error.message || 'Falha ao salvar índice de clipes na nuvem.');
+
+  // Limpa versões antigas do índice em segundo plano — não bloqueia nem faz
+  // a escrita atual falhar caso isso não funcione.
+  utapi
+    .listFiles({ limit: 500 })
+    .then(({ files }) => {
+      const stale = files.filter((f) => f.name.startsWith(INDEX_NAME_PREFIX) && f.name !== name && f.status === 'Uploaded');
+      if (stale.length) return utapi.deleteFiles(stale.map((f) => f.key));
+    })
+    .catch((err) => console.error('Falha ao limpar versões antigas do índice:', err));
 }
 
 async function readIndex() {

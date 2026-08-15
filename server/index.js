@@ -82,6 +82,7 @@ app.post('/api/clips', upload.single('video'), async (req, res) => {
     });
     res.json(entry);
   } catch (err) {
+    console.error('Falha ao enviar clipe:', err);
     res.status(500).json({ error: err.message || 'Falha ao enviar clipe.' });
   }
 });
@@ -91,8 +92,9 @@ app.delete('/api/clips/:hash', async (req, res) => {
   try {
     await deleteCloudClip(req.params.hash);
     res.json({ ok: true });
-  } catch {
-    res.status(500).json({ error: 'Falha ao remover clipe.' });
+  } catch (err) {
+    console.error('Falha ao remover clipe:', err);
+    res.status(500).json({ error: err.message || 'Falha ao remover clipe.' });
   }
 });
 

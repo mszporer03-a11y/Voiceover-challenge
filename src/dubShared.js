@@ -526,6 +526,8 @@ function renderTaggingForm(cardEl, file, previewVideo, rows, { onSaved, onCancel
       await updateClip(saved.id, { cloudHash: entry.hash, cloudUrl: entry.url });
     } catch (err) {
       console.error('Falha ao enviar clipe pra nuvem:', err);
+      statusEl.textContent = `Salvo localmente, mas não foi pra galeria da nuvem: ${err.message || 'erro desconhecido'}. Outros aparelhos não vão ver esse clipe.`;
+      await new Promise((r) => setTimeout(r, 2500));
     }
     onSaved?.();
   });
