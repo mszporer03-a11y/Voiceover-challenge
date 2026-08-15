@@ -134,19 +134,23 @@ export async function getMergedGalleryClips() {
   return merged;
 }
 
-// Garante que um item da lista combinada vire um clipe local de verdade
-// (baixando da nuvem e salvando no IndexedDB se ainda for só uma entrada
-// remota) — usado tanto ao clicar em "Jogar"/"Editar" quanto no sorteio.
+// Garante que um item da lista combinada vire um clipe pronto pra jogar
+// (baixando da nuvem se ainda for só uma entrada remota) — usado tanto ao
+// clicar em "Jogar"/"Editar" quanto no sorteio.
 async function resolveMergedClip(item) {
   if (item.kind === 'local') return item.clip;
   const entry = item.entry;
   const videoBlob = await fetchCloudClipBlob(entry.url);
   const video = document.createElement('video');
   video.src = URL.createObjectURL(videoBlob);
-  await new Promise((resolve) => video.addEventListener('loadedmetadata', resolve, { once: true }));
+  await new Promise((resolve, reject) => {
+    video.addEventListener('loadedmetadata', resolve, { once: true });
+    video.addEventListener('error', () => reject(new Error('Não foi possível ler o vídeo baixado.')), { once: true });
+  });
   const thumbnailDataUrl = await captureThumbnail(video);
   URL.revokeObjectURL(video.src);
-  return addClip({
+
+  const payload = {
     name: entry.name,
     videoBlob,
     thumbnailDataUrl,
@@ -155,7 +159,23 @@ async function resolveMergedClip(item) {
     characters: entry.characters || [],
     cloudHash: entry.hash,
     cloudUrl: entry.url,
-  });
+  };
+
+  // Salvar no IndexedDB pode travar em navegadores móveis com blobs grandes
+  // (bug conhecido do Safari/iOS ao gravar Blob via structured clone) — isso
+  // não pode bloquear o jogador, que já tem o vídeo em memória e pode jogar
+  // na hora. Se salvar não terminar rápido, segue com um clipe "efêmero"
+  // (funciona pra jogar agora, só não fica salvo localmente) enquanto a
+  // gravação de verdade continua tentando em segundo plano.
+  const saved = await Promise.race([
+    addClip(payload).catch((err) => {
+      console.error('Falha ao salvar clipe baixado localmente:', err);
+      return null;
+    }),
+    new Promise((resolve) => setTimeout(() => resolve(null), 4000)),
+  ]);
+
+  return saved || { id: `ephemeral-${Date.now()}`, createdAt: Date.now(), ...payload };
 }
 
 /** Sorteia um clipe entre TODOS os disponíveis — locais e da nuvem ainda não
@@ -192,7 +212,21 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
   if (onClose) cardEl.querySelector('#dub-gallery-close-btn').addEventListener('click', onClose);
 
   extraButtons.forEach((b, i) => {
-    cardEl.querySelector(`#dub-gallery-extra-${i}`)?.addEventListener('click', () => b.onClick());
+    const btn = cardEl.querySelector(`#dub-gallery-extra-${i}`);
+    if (!btn) return;
+    const originalLabel = btn.textContent;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = '⏳ Carregando…';
+      try {
+        await b.onClick();
+      } catch (err) {
+        alert(`Não foi possível concluir: ${err.message || 'erro desconhecido'}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+      }
+    });
   });
 
   cardEl.querySelector('#dub-add-input').addEventListener('change', (e) => {
@@ -225,7 +259,7 @@ export async function renderGalleryScreen(cardEl, resources, opts = {}) {
     const card = el(`
       <div class="solo-clip-card">
         ${
-          isLocal
+          data.thumbnailDataUrl
             ? `<img src="${data.thumbnailDataUrl}" alt="${data.name}" />`
             : `<div class="solo-clip-thumb-placeholder" title="Ainda só na nuvem — baixa ao jogar/editar">☁</div>`
         }
@@ -881,9 +915,18 @@ export function renderResultScreen(cardEl, resources, clip, recordings, opts = {
   const actionsEl = cardEl.querySelector('#dub-result-actions');
   actions.forEach(({ label, className, onClick }) => {
     const btn = el(`<button class="${className || 'menu-btn-primary'}" type="button">${label}</button>`);
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       playback.stop();
-      onClick();
+      btn.disabled = true;
+      const originalLabel = btn.textContent;
+      btn.textContent = '⏳ Carregando…';
+      try {
+        await onClick();
+      } catch (err) {
+        alert(`Não foi possível concluir: ${err.message || 'erro desconhecido'}`);
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+      }
     });
     actionsEl.appendChild(btn);
   });

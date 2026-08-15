@@ -116,7 +116,7 @@ export async function findClipByHash(hash) {
 // índice — exatamente o que acontecia antes desse arquivo existir, quando o
 // índice vivia só no disco e era perdido a cada redeploy — recupera a
 // entrada em vez de falhar com "customId já existe".
-async function recoverOrphanedUpload(hash, ext, name, durationSec, segments, characters) {
+async function recoverOrphanedUpload(hash, ext, name, thumbnailDataUrl, durationSec, segments, characters) {
   const [entry] = (await utapi.getFileUrls(hash, { keyType: 'customId' })).data;
   if (!entry?.url) return null;
   let sizeBytes = 0;
@@ -131,6 +131,7 @@ async function recoverOrphanedUpload(hash, ext, name, durationSec, segments, cha
     key: entry.key,
     url: entry.url,
     name,
+    thumbnailDataUrl,
     durationSec,
     segments,
     characters,
@@ -139,7 +140,17 @@ async function recoverOrphanedUpload(hash, ext, name, durationSec, segments, cha
   };
 }
 
-export async function uploadAndRegisterClip({ hash, ext, buffer, contentType, name, durationSec, segments, characters }) {
+export async function uploadAndRegisterClip({
+  hash,
+  ext,
+  buffer,
+  contentType,
+  name,
+  thumbnailDataUrl,
+  durationSec,
+  segments,
+  characters,
+}) {
   return withLock(async () => {
     const list = await readIndex();
     const existing = list.find((c) => c.hash === hash);
@@ -147,7 +158,14 @@ export async function uploadAndRegisterClip({ hash, ext, buffer, contentType, na
       // Mesmo vídeo já está lá (dedupe por hash) — não reenvia o binário,
       // mas atualiza nome/falas/personagens, já que quem chamou pode ter
       // editado as tags depois do primeiro envio.
-      Object.assign(existing, { name, durationSec, segments, characters, updatedAt: Date.now() });
+      Object.assign(existing, {
+        name,
+        thumbnailDataUrl: thumbnailDataUrl || existing.thumbnailDataUrl,
+        durationSec,
+        segments,
+        characters,
+        updatedAt: Date.now(),
+      });
       await writeIndex(list);
       return existing;
     }
@@ -157,7 +175,7 @@ export async function uploadAndRegisterClip({ hash, ext, buffer, contentType, na
 
     let entry;
     if (error) {
-      entry = await recoverOrphanedUpload(hash, ext, name, durationSec, segments, characters);
+      entry = await recoverOrphanedUpload(hash, ext, name, thumbnailDataUrl, durationSec, segments, characters);
       if (!entry) throw new Error(error.message || 'Falha ao enviar pro UploadThing.');
     } else {
       entry = {
@@ -165,6 +183,7 @@ export async function uploadAndRegisterClip({ hash, ext, buffer, contentType, na
         key: data.key,
         url: data.url,
         name,
+        thumbnailDataUrl,
         durationSec,
         segments,
         characters,

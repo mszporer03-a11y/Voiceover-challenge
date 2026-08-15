@@ -42,6 +42,7 @@ export async function uploadClipToCloud(clip, onProgress) {
   form.append('hash', hash);
   form.append('ext', ext);
   form.append('name', clip.name);
+  form.append('thumbnailDataUrl', clip.thumbnailDataUrl || '');
   form.append('durationSec', String(clip.durationSec || 0));
   form.append('segments', JSON.stringify(clip.segments));
   form.append('characters', JSON.stringify(clip.characters));

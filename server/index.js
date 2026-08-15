@@ -58,7 +58,7 @@ app.get('/api/clips', async (req, res) => {
 
 app.post('/api/clips', upload.single('video'), async (req, res) => {
   if (!cloudEnabled) return res.status(503).json({ error: 'Armazenamento em nuvem não configurado.' });
-  const { hash, ext, name, durationSec } = req.body || {};
+  const { hash, ext, name, durationSec, thumbnailDataUrl } = req.body || {};
   let segments, characters;
   try {
     segments = JSON.parse(req.body?.segments || '[]');
@@ -76,6 +76,7 @@ app.post('/api/clips', upload.single('video'), async (req, res) => {
       buffer: req.file.buffer,
       contentType: req.file.mimetype || 'video/webm',
       name: name || 'Clipe sem nome',
+      thumbnailDataUrl: thumbnailDataUrl || null,
       durationSec: Number(durationSec) || 0,
       segments,
       characters,
