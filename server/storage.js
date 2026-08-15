@@ -117,7 +117,7 @@ export async function findClipByHash(hash) {
 // índice vivia só no disco e era perdido a cada redeploy — recupera a
 // entrada em vez de falhar com "customId já existe".
 async function recoverOrphanedUpload(hash, ext, name, durationSec, segments, characters) {
-  const [entry] = await utapi.getFileUrls(hash, { keyType: 'customId' });
+  const [entry] = (await utapi.getFileUrls(hash, { keyType: 'customId' })).data;
   if (!entry?.url) return null;
   let sizeBytes = 0;
   try {
