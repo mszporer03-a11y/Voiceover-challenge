@@ -11,18 +11,20 @@ import {
 
 // Orchestrates a full round of online dubbing inside a Socket.io room, in
 // any of the 3 modes also offered locally (multiplayerMode.js):
-//   - same-clip: everyone dubs the whole clip, one after another.
-//   - coop: one clip, its characters split across players.
-//   - different-clips: host assigns a different clip to each player.
+//   - same-clip: everyone dubs the whole clip, all at the same time.
+//   - coop: one clip, its characters split across players, one at a time.
+//   - different-clips: host assigns a different clip to each player, all
+//     dubbing at the same time.
 // Host picks clip(s) from their local gallery -> sent peer-to-peer (WebRTC
-// data channels, see webrtc.js) to everyone else -> players take turns
-// dubbing their assigned clip/segments (reusing the same guided-recording
-// screen as Solo/Multiplayer local) -> recordings are relayed P2P to
-// everyone -> vote -> server-tallied scoreboard. The server only ever sees
-// clip *metadata* and small coordination messages — video/audio stays P2P.
+// data channels, see webrtc.js) to everyone else -> players dub their
+// assigned clip/segments (reusing the same guided-recording screen as
+// Solo/Multiplayer local) -> recordings are relayed P2P to everyone ->
+// each dub is presented for playback -> vote (15s max) -> server-tallied
+// scoreboard. The server only ever sees clip *metadata* and small
+// coordination messages — video/audio stays P2P.
 
 const MODES = [
-  { id: 'same-clip', label: 'Mesmo clipe', description: 'Todo mundo dubla o mesmo clipe inteiro, um de cada vez.' },
+  { id: 'same-clip', label: 'Mesmo clipe', description: 'Todo mundo dubla o mesmo clipe inteiro, todos ao mesmo tempo.' },
   { id: 'coop', label: 'Cooperativo', description: 'Um clipe só, personagens divididos entre os jogadores.' },
   {
     id: 'different-clips',
@@ -40,6 +42,26 @@ let selectedModeId = 'same-clip';
 let clipQueue = []; // clips being picked by the host before select-clips is sent
 let sharedClips = []; // clipIndex -> { name, durationSec, segments, characters, videoBlob }
 let clipReadySent = false;
+let autoSkipSent = false; // guards the "no lines assigned" auto turn-done from firing more than once
+
+// True while runGuidedRecording owns cardEl for this client — a room-update
+// (or a P2P file landing) can arrive at any moment now that every player
+// records at the same time, and re-rendering over it would yank away the
+// mic/video the player is actively using mid-take.
+let recordingInProgress = false;
+
+// Presentation stage shown before the score form (task: "clipes devem ser
+// apresentados antes da votação") — built once per VOTING round.
+let presentationQueue = null; // array of playerIds, or ['__coop__'] for the merged team dub
+let presentationIndex = 0;
+let presentationDone = false;
+
+// True while the score form is up for this client — guards it the same way
+// as recordingInProgress, so another player's vote landing mid-broadcast
+// doesn't reset inputs the player is still filling in (or restart their
+// countdown).
+let votingFormActive = false;
+let voteTimerInterval = null;
 
 /** playerId -> Map(segmentId -> Blob) */
 const allRecordings = new Map();
@@ -72,9 +94,23 @@ export function initOnlineGame({ overlayId, openBtnId } = {}) {
 function resetRoundState() {
   sharedClips = [];
   clipReadySent = false;
+  autoSkipSent = false;
+  recordingInProgress = false;
+  presentationQueue = null;
+  presentationIndex = 0;
+  presentationDone = false;
+  votingFormActive = false;
+  clearVoteTimer();
   allRecordings.clear();
   receiveProgress.clear();
   fetchingCloudClips.clear();
+}
+
+function clearVoteTimer() {
+  if (voteTimerInterval) {
+    clearInterval(voteTimerInterval);
+    voteTimerInterval = null;
+  }
 }
 
 function open() {
@@ -179,6 +215,9 @@ async function maybeFetchCloudClips() {
 
 function render() {
   if (!cardEl || !latestSnapshot) return;
+  // Don't rebuild the card out from under an active recording or an
+  // in-progress vote — see the flags' declarations for why.
+  if (recordingInProgress || votingFormActive) return;
   switch (latestSnapshot.gameState) {
     case 'PICKING':
       return renderPicking();
@@ -321,6 +360,12 @@ function renderPicking() {
 }
 
 function renderDubbing() {
+  return latestSnapshot.modeId === 'coop' ? renderSequentialDubbing() : renderSimultaneousDubbing();
+}
+
+// 'coop': one clip, characters split across players — still one at a time
+// so it reads like a shared performance, in turnOrder order.
+function renderSequentialDubbing() {
   const currentPlayerId = latestSnapshot.currentPlayerId;
   const myTurn = currentPlayerId === socket.id;
   const assignment = latestSnapshot.assignments?.[currentPlayerId];
@@ -367,6 +412,7 @@ function renderDubbing() {
     segments: clip.segments.filter((s) => assignment.segmentIds.includes(s.id)),
   };
 
+  recordingInProgress = true;
   runGuidedRecording(cardEl, resources, myClip, {
     titleText: `DUBLANDO — ${myName()}`,
     onDone: async (recordings) => {
@@ -378,17 +424,149 @@ function renderDubbing() {
       for (const [segmentId, blob] of recordings) {
         await sendFileToAllPeers(blob, { kind: 'recording', playerId: socket.id, segmentId });
       }
+      recordingInProgress = false;
       socket.emit('turn-done');
     },
   });
 }
 
+// 'same-clip'/'different-clips': everyone records at the same time — each
+// player renders their own recording screen right away instead of waiting
+// for a turn, and just watches a "who's done" list once they've submitted.
+function renderSimultaneousDubbing() {
+  const myId = socket.id;
+  const assignment = latestSnapshot.assignments?.[myId];
+  const clip = assignment ? sharedClips[assignment.clipIndex] : null;
+  const doneIds = latestSnapshot.doneIds || [];
+  const amDone = doneIds.includes(myId);
+
+  if (!clip) {
+    cardEl.innerHTML = `
+      <h2 class="menu-logo" style="font-size:20px;">DUBLANDO</h2>
+      <p class="menu-status">Carregando clipe…</p>
+    `;
+    return;
+  }
+
+  function waitingRows() {
+    return latestSnapshot.players
+      .map((p) => {
+        const pDone = doneIds.includes(p.id) || latestSnapshot.assignments?.[p.id]?.segmentIds.length === 0;
+        return `<div class="mp-assign-row">${p.name}${p.id === myId ? ' (você)' : ''} — ${
+          pDone ? '✅ pronto' : '🎙 gravando…'
+        }</div>`;
+      })
+      .join('');
+  }
+
+  if (assignment.segmentIds.length === 0) {
+    if (!amDone && !autoSkipSent) {
+      autoSkipSent = true;
+      socket.emit('turn-done');
+    }
+    cardEl.innerHTML = `
+      <h2 class="menu-logo" style="font-size:20px;">DUBLANDO</h2>
+      <p class="menu-status">Você não tem falas nesse clipe — aguardando os outros jogadores…</p>
+      <div class="mp-assign-list">${waitingRows()}</div>
+    `;
+    return;
+  }
+
+  if (amDone) {
+    cardEl.innerHTML = `
+      <h2 class="menu-logo" style="font-size:20px;">DUBLANDO</h2>
+      <p class="menu-tagline">Sua dublagem foi enviada!</p>
+      <p class="menu-status">Aguardando os outros jogadores terminarem…</p>
+      <div class="mp-assign-list">${waitingRows()}</div>
+    `;
+    return;
+  }
+
+  const myClip = {
+    ...clip,
+    segments: clip.segments.filter((s) => assignment.segmentIds.includes(s.id)),
+  };
+
+  recordingInProgress = true;
+  runGuidedRecording(cardEl, resources, myClip, {
+    titleText: `DUBLANDO — ${myName()}`,
+    onDone: async (recordings) => {
+      allRecordings.set(myId, recordings);
+      cardEl.innerHTML = `
+        <h2 class="menu-logo" style="font-size:20px;">ENVIANDO SUA DUBLAGEM</h2>
+        <p class="menu-status">Compartilhando com os outros jogadores…</p>
+      `;
+      for (const [segmentId, blob] of recordings) {
+        await sendFileToAllPeers(blob, { kind: 'recording', playerId: myId, segmentId });
+      }
+      recordingInProgress = false;
+      socket.emit('turn-done');
+    },
+  });
+}
+
+const VOTE_TIME_LIMIT_SEC = 15;
+
 function renderVoting() {
+  return presentationDone ? renderVoteForm() : renderPresentation();
+}
+
+// Plays back every dubbed clip before voting opens — each other player's
+// take (or, in coop, the one merged team dub), one at a time.
+function renderPresentation() {
+  if (!presentationQueue) {
+    presentationQueue =
+      latestSnapshot.modeId === 'coop'
+        ? ['__coop__']
+        : latestSnapshot.players.filter((p) => p.id !== socket.id).map((p) => p.id);
+    presentationIndex = 0;
+  }
+
+  if (!presentationQueue.length) {
+    presentationDone = true;
+    return renderVoteForm();
+  }
+
+  const isLast = presentationIndex === presentationQueue.length - 1;
+  const nextLabel = isLast ? 'Ir para votação 🗳' : 'Próxima dublagem ▶';
+  const goNext = () => {
+    if (isLast) presentationDone = true;
+    else presentationIndex += 1;
+    render();
+  };
+
+  const current = presentationQueue[presentationIndex];
+  const stepLabel = `Assistindo ${presentationIndex + 1}/${presentationQueue.length}`;
+
+  if (current === '__coop__') {
+    const merged = new Map();
+    allRecordings.forEach((segMap) => segMap.forEach((blob, segId) => merged.set(segId, blob)));
+    renderResultScreen(cardEl, resources, sharedClips[0], merged, {
+      title: 'Dublagem da equipe',
+      tagline: `${stepLabel} — ${sharedClips[0]?.name || ''}`,
+      actions: [{ label: nextLabel, onClick: goNext }],
+    });
+    return;
+  }
+
+  const clipIndex = latestSnapshot.assignments?.[current]?.clipIndex ?? 0;
+  const clip = sharedClips[clipIndex];
+  const recordings = allRecordings.get(current) || new Map();
+  renderResultScreen(cardEl, resources, clip, recordings, {
+    title: `Dublagem de ${playerName(current)}`,
+    tagline: `${stepLabel} — ${clip?.name || ''}`,
+    actions: [{ label: nextLabel, onClick: goNext }],
+  });
+}
+
+function renderVoteForm() {
   const others = latestSnapshot.players.filter((p) => p.id !== socket.id);
   if (!others.length) {
     cardEl.innerHTML = `<h2 class="menu-logo" style="font-size:20px;">VOTAÇÃO</h2><p class="menu-status">Aguardando outros jogadores…</p>`;
     return;
   }
+
+  votingFormActive = true;
 
   const rows = others
     .map(
@@ -403,6 +581,7 @@ function renderVoting() {
   cardEl.innerHTML = `
     <h2 class="menu-logo" style="font-size:20px;">VOTAÇÃO</h2>
     <p class="menu-tagline">Dê uma nota de 0 a 10 pra cada dublagem</p>
+    <p id="og-vote-timer" class="mp-vote-timer"></p>
     <div class="mp-vote-list">${rows}</div>
     <div class="menu-section">
       <button id="og-vote-confirm-btn" class="menu-btn-primary" type="button">Confirmar notas</button>
@@ -410,15 +589,35 @@ function renderVoting() {
     <p id="og-vote-status" class="menu-status"></p>
   `;
 
-  cardEl.querySelector('#og-vote-confirm-btn').addEventListener('click', (e) => {
+  const timerEl = cardEl.querySelector('#og-vote-timer');
+  const confirmBtn = cardEl.querySelector('#og-vote-confirm-btn');
+  const statusEl = cardEl.querySelector('#og-vote-status');
+
+  const submitVotes = (auto) => {
+    clearVoteTimer();
+    votingFormActive = false;
     const scores = {};
     cardEl.querySelectorAll('.mp-vote-input').forEach((input) => {
       scores[input.dataset.playerId] = Number(input.value) || 0;
     });
     socket.emit('submit-votes', scores);
-    e.target.disabled = true;
-    cardEl.querySelector('#og-vote-status').textContent = 'Voto enviado — aguardando os outros jogadores…';
-  });
+    confirmBtn.disabled = true;
+    statusEl.textContent = auto
+      ? 'Tempo esgotado — notas enviadas automaticamente.'
+      : 'Voto enviado — aguardando os outros jogadores…';
+  };
+
+  confirmBtn.addEventListener('click', () => submitVotes(false));
+
+  const deadline = Date.now() + VOTE_TIME_LIMIT_SEC * 1000;
+  const tick = () => {
+    const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    timerEl.textContent = `⏱ ${remaining}s`;
+    timerEl.classList.toggle('mp-vote-timer-urgent', remaining <= 5);
+    if (remaining <= 0) submitVotes(true);
+  };
+  tick();
+  voteTimerInterval = setInterval(tick, 250);
 }
 
 function renderResults() {

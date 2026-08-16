@@ -330,9 +330,12 @@ function renderResultsCarousel(results, players) {
 
 // ---------- Votação e placar (compartilhados pelos 3 modos) ----------
 
+const VOTE_TIME_LIMIT_SEC = 15;
+
 function runVoting(players, onDone) {
   const scores = new Map(players.map((p) => [p.id, 0]));
   let raterIndex = 0;
+  let timerInterval = null;
 
   function showRater() {
     const rater = players[raterIndex];
@@ -350,13 +353,17 @@ function runVoting(players, onDone) {
     cardEl.innerHTML = `
       <h2 class="menu-logo" style="font-size:22px;">VOTAÇÃO</h2>
       <p class="menu-tagline">${rater.name}, dê uma nota de 0 a 10 pra cada jogador</p>
+      <p id="mp-vote-timer" class="mp-vote-timer"></p>
       <div class="mp-vote-list">${rows}</div>
       <div class="menu-section">
         <button id="mp-vote-confirm-btn" class="menu-btn-primary" type="button">Confirmar notas</button>
       </div>
     `;
 
-    cardEl.querySelector('#mp-vote-confirm-btn').addEventListener('click', () => {
+    const timerEl = cardEl.querySelector('#mp-vote-timer');
+
+    const advance = () => {
+      if (timerInterval) clearInterval(timerInterval);
       cardEl.querySelectorAll('.mp-vote-input').forEach((input) => {
         const playerId = input.dataset.playerId;
         const value = Math.max(0, Math.min(10, Math.round(parseFloat(input.value) || 0)));
@@ -365,7 +372,19 @@ function runVoting(players, onDone) {
       raterIndex += 1;
       if (raterIndex < players.length) showRater();
       else onDone(scores);
-    });
+    };
+
+    cardEl.querySelector('#mp-vote-confirm-btn').addEventListener('click', advance);
+
+    const deadline = Date.now() + VOTE_TIME_LIMIT_SEC * 1000;
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      timerEl.textContent = `⏱ ${remaining}s`;
+      timerEl.classList.toggle('mp-vote-timer-urgent', remaining <= 5);
+      if (remaining <= 0) advance();
+    };
+    tick();
+    timerInterval = setInterval(tick, 250);
   }
 
   showRater();

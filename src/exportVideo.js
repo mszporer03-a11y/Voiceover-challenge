@@ -19,7 +19,14 @@ function pickSupportedMimeType() {
  */
 export async function exportDubbedVideo(clip, recordings, { onProgress } = {}) {
   const video = document.createElement('video');
-  video.muted = true; // no direct-to-speakers output; audio is routed through the Web Audio graph below
+  // Stays unmuted: some browsers (Chrome included) also silence a muted
+  // element's audio inside the Web Audio graph, not just its direct output.
+  // With .muted = true that killed originalGain's signal entirely, so any
+  // stretch relying on it — gaps with no dialogue, or lines nobody
+  // re-recorded — came out silent in the exported file instead of keeping
+  // the original audio. Whatever of this leaks to real speakers during
+  // export is harmless: only `destination` below (never audioCtx.destination)
+  // is what actually gets recorded.
   video.playsInline = true;
   const videoUrl = URL.createObjectURL(clip.videoBlob);
   video.src = videoUrl;
