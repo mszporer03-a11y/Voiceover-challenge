@@ -62,6 +62,11 @@ let presentationDone = false;
 // countdown).
 let votingFormActive = false;
 let voteTimerInterval = null;
+// True once THIS client's vote is in for the round — the server rebroadcasts
+// room-update on every submit-votes, not just the one that ends voting, so
+// renderVoteForm needs this (separate from votingFormActive) to know not to
+// rebuild the form/timer for someone who's already done.
+let myVoteSubmitted = false;
 
 /** playerId -> Map(segmentId -> Blob) */
 const allRecordings = new Map();
@@ -100,6 +105,7 @@ function resetRoundState() {
   presentationIndex = 0;
   presentationDone = false;
   votingFormActive = false;
+  myVoteSubmitted = false;
   clearVoteTimer();
   allRecordings.clear();
   receiveProgress.clear();
@@ -566,6 +572,19 @@ function renderVoteForm() {
     return;
   }
 
+  // The server rebroadcasts room-update on every submit-votes, even ones
+  // that don't move the room past VOTING — without this check, each OTHER
+  // player confirming their notes would rebuild this form and restart the
+  // timer for someone who already voted.
+  if (myVoteSubmitted) {
+    cardEl.innerHTML = `
+      <h2 class="menu-logo" style="font-size:20px;">VOTAÇÃO</h2>
+      <p class="menu-tagline">Dê uma nota de 0 a 10 pra cada dublagem</p>
+      <p class="menu-status">Voto enviado — aguardando os outros jogadores…</p>
+    `;
+    return;
+  }
+
   votingFormActive = true;
 
   const rows = others
@@ -596,6 +615,7 @@ function renderVoteForm() {
   const submitVotes = (auto) => {
     clearVoteTimer();
     votingFormActive = false;
+    myVoteSubmitted = true;
     const scores = {};
     cardEl.querySelectorAll('.mp-vote-input').forEach((input) => {
       scores[input.dataset.playerId] = Number(input.value) || 0;
