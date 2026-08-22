@@ -1,4 +1,4 @@
-import { socket, connectSocket } from './socket.js';
+import { socket, connectSocket, getPlayerToken } from './socket.js';
 
 const GAME_STATE_LABELS = {
   LOBBY: 'Esperando',
@@ -63,11 +63,27 @@ export function initNetwork({ onJoinedRoom }) {
     onJoinedRoom?.(roomId);
   }
 
+  // Fires after the socket auto-reconnects (new socket.id) following a
+  // dropped connection — reclaims our old seat in the room instead of
+  // leaving the client stuck on a stale snapshot forever. Doesn't call
+  // onJoinedRoom: the player may be mid-game with the room overlay
+  // deliberately hidden behind the game overlay, and popping it back up
+  // would yank focus away from whatever they're doing.
+  function handleRejoinResponse(response) {
+    if (response?.error) {
+      setStatus(response.error);
+      return;
+    }
+    roomId = response.roomId;
+    setStatus('Reconectado.');
+    renderRoom(response);
+  }
+
   el.createBtn.addEventListener('click', async () => {
     setStatus('Conectando ao servidor...');
     try {
       await connectSocket();
-      socket.emit('create-room', el.nameInput.value, handleResponse);
+      socket.emit('create-room', { playerName: el.nameInput.value, playerToken: getPlayerToken() }, handleResponse);
     } catch {
       setStatus('Não foi possível conectar ao servidor (rode "npm run server").');
     }
@@ -82,7 +98,11 @@ export function initNetwork({ onJoinedRoom }) {
     setStatus('Conectando ao servidor...');
     try {
       await connectSocket();
-      socket.emit('join-room', { roomId: code, playerName: el.nameInput.value }, handleResponse);
+      socket.emit(
+        'join-room',
+        { roomId: code, playerName: el.nameInput.value, playerToken: getPlayerToken() },
+        handleResponse
+      );
     } catch {
       setStatus('Não foi possível conectar ao servidor (rode "npm run server").');
     }
@@ -91,7 +111,17 @@ export function initNetwork({ onJoinedRoom }) {
   socket.on('room-update', renderRoom);
 
   socket.on('disconnect', () => {
-    setStatus('Desconectado do servidor.');
+    setStatus(roomId ? 'Conexão perdida — tentando reconectar…' : 'Desconectado do servidor.');
+  });
+
+  // socket.io-client reconnects on its own after an involuntary drop (it
+  // only skips this after an explicit socket.disconnect(), which is what
+  // leaveRoom() below uses) — but it comes back with a brand-new socket.id,
+  // so the server needs to be told this is the same player rejoining.
+  socket.io.on('reconnect', () => {
+    if (roomId) {
+      socket.emit('rejoin-room', { roomId, playerToken: getPlayerToken() }, handleRejoinResponse);
+    }
   });
 
   return {

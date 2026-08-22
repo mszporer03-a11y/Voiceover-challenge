@@ -22,9 +22,16 @@ const io = new Server(httpServer, {
   cors: { origin: '*' },
 });
 
+// Grace period between a socket dropping and the player actually being
+// removed from the room — long enough to survive a brief WebSocket hiccup
+// (e.g. reconnecting mid clip-transfer) via rejoin-room, without leaving a
+// truly-gone player blocking "everyone ready/done" checks for too long.
+const DISCONNECT_GRACE_MS = 12000;
+
 /**
  * roomId -> {
- *   players: Map(socketId -> { name }),
+ *   players: Map(socketId -> { name, token }),
+ *   pendingDisconnects: Map(socketId -> Timeout),
  *   hostId: string,
  *   gameState: 'LOBBY' | 'PICKING' | 'DUBBING' | 'VOTING' | 'RESULTS',
  *   modeId: 'same-clip' | 'coop' | 'different-clips',
@@ -201,7 +208,7 @@ function broadcastRoom(roomId) {
 io.on('connection', (socket) => {
   let currentRoomId = null;
 
-  function joinRoom(roomId, playerName, callback, { asHost } = {}) {
+  function joinRoom(roomId, playerName, playerToken, callback, { asHost } = {}) {
     const room = rooms.get(roomId);
     if (!room) {
       callback?.({ error: 'Sala não encontrada.' });
@@ -216,6 +223,7 @@ io.on('connection', (socket) => {
     currentRoomId = roomId;
     room.players.set(socket.id, {
       name: playerName?.trim() || `Jogador ${room.players.size + 1}`,
+      token: playerToken || null,
     });
     if (asHost) room.hostId = socket.id;
 
@@ -223,17 +231,79 @@ io.on('connection', (socket) => {
     broadcastRoom(roomId);
   }
 
-  socket.on('create-room', (playerName, callback) => {
+  socket.on('create-room', ({ playerName, playerToken } = {}, callback) => {
     let roomId = makeRoomId();
     while (rooms.has(roomId)) roomId = makeRoomId();
-    const room = { players: new Map(), hostId: socket.id };
+    const room = { players: new Map(), pendingDisconnects: new Map(), hostId: socket.id };
     resetRoomGame(room);
     rooms.set(roomId, room);
-    joinRoom(roomId, playerName, callback, { asHost: true });
+    joinRoom(roomId, playerName, playerToken, callback, { asHost: true });
   });
 
-  socket.on('join-room', ({ roomId, playerName } = {}, callback) => {
-    joinRoom(String(roomId || '').toUpperCase(), playerName, callback);
+  socket.on('join-room', ({ roomId, playerName, playerToken } = {}, callback) => {
+    joinRoom(String(roomId || '').toUpperCase(), playerName, playerToken, callback);
+  });
+
+  // A client whose socket dropped (network hiccup, tab backgrounded, etc.)
+  // and reconnected with a brand-new socket.id calls this instead of
+  // join-room, so it re-takes its old seat instead of showing up as a new
+  // player — see the 'disconnect' handler below for the other half of this.
+  socket.on('rejoin-room', ({ roomId, playerToken } = {}, callback) => {
+    const normalizedRoomId = String(roomId || '').toUpperCase();
+    const room = rooms.get(normalizedRoomId);
+    if (!room) {
+      callback?.({ error: 'Sala não encontrada.' });
+      return;
+    }
+
+    let oldSocketId = null;
+    for (const id of room.pendingDisconnects.keys()) {
+      if (playerToken && room.players.get(id)?.token === playerToken) {
+        oldSocketId = id;
+        break;
+      }
+    }
+    if (!oldSocketId) {
+      callback?.({ error: 'Não foi possível reconectar à sala (tempo esgotado).' });
+      return;
+    }
+
+    clearTimeout(room.pendingDisconnects.get(oldSocketId));
+    room.pendingDisconnects.delete(oldSocketId);
+
+    // Re-key every piece of per-player state from the old socket.id to the
+    // new one so the reconnecting client resumes exactly where it left off.
+    const playerData = room.players.get(oldSocketId);
+    room.players.delete(oldSocketId);
+    room.players.set(socket.id, playerData);
+
+    if (room.hostId === oldSocketId) room.hostId = socket.id;
+    room.turnOrder = room.turnOrder.map((id) => (id === oldSocketId ? socket.id : id));
+    if (room.clipReadyIds.delete(oldSocketId)) room.clipReadyIds.add(socket.id);
+    if (room.doneIds.delete(oldSocketId)) room.doneIds.add(socket.id);
+    if (room.assignments[oldSocketId]) {
+      room.assignments[socket.id] = room.assignments[oldSocketId];
+      delete room.assignments[oldSocketId];
+    }
+    if (room.votes.has(oldSocketId)) {
+      room.votes.set(socket.id, room.votes.get(oldSocketId));
+      room.votes.delete(oldSocketId);
+    }
+    room.votes.forEach((scoresGiven) => {
+      if (scoresGiven.has(oldSocketId)) {
+        scoresGiven.set(socket.id, scoresGiven.get(oldSocketId));
+        scoresGiven.delete(oldSocketId);
+      }
+    });
+    room.scoreboard?.forEach((entry) => {
+      if (entry.playerId === oldSocketId) entry.playerId = socket.id;
+    });
+
+    socket.join(normalizedRoomId);
+    currentRoomId = normalizedRoomId;
+
+    callback?.({ roomId: normalizedRoomId, ...roomSnapshot(room) });
+    broadcastRoom(normalizedRoomId);
   });
 
   // Host announces which clip(s) the room will dub, and in what mode. Only
@@ -359,32 +429,50 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (!currentRoomId) return;
     const room = rooms.get(currentRoomId);
-    if (!room) return;
-    room.players.delete(socket.id);
-    room.turnOrder = room.turnOrder.filter((id) => id !== socket.id);
-    room.clipReadyIds?.delete(socket.id);
-    room.doneIds?.delete(socket.id);
-    room.votes?.delete(socket.id);
+    if (!room || !room.players.has(socket.id)) return;
 
-    if (room.players.size === 0) {
-      rooms.delete(currentRoomId);
-      return;
-    }
-    if (room.hostId === socket.id) {
-      room.hostId = room.players.keys().next().value;
-    }
-    if (room.gameState === 'DUBBING') {
-      const stillWaiting = isSimultaneousMode(room.modeId)
-        ? ![...room.players.keys()].every((id) => room.doneIds.has(id) || room.assignments[id]?.segmentIds.length === 0)
-        : room.turnIndex < room.turnOrder.length;
-      if (!stillWaiting) {
-        room.gameState = 'VOTING';
-        room.votes = new Map();
-      }
-    }
-    broadcastRoom(currentRoomId);
+    // Don't drop the player immediately — give them a window to reconnect
+    // and call rejoin-room (see above) before treating this as a real exit.
+    // Otherwise a brief network hiccup right as the host picks a clip reads
+    // to everyone else as that player getting kicked from the room.
+    const roomId = currentRoomId;
+    const disconnectedSocketId = socket.id;
+    const timeout = setTimeout(() => {
+      finalizeDisconnect(roomId, disconnectedSocketId);
+    }, DISCONNECT_GRACE_MS);
+    room.pendingDisconnects.set(socket.id, timeout);
   });
 });
+
+function finalizeDisconnect(roomId, socketId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  room.pendingDisconnects.delete(socketId);
+  if (!room.players.delete(socketId)) return;
+
+  room.turnOrder = room.turnOrder.filter((id) => id !== socketId);
+  room.clipReadyIds?.delete(socketId);
+  room.doneIds?.delete(socketId);
+  room.votes?.delete(socketId);
+
+  if (room.players.size === 0) {
+    rooms.delete(roomId);
+    return;
+  }
+  if (room.hostId === socketId) {
+    room.hostId = room.players.keys().next().value;
+  }
+  if (room.gameState === 'DUBBING') {
+    const stillWaiting = isSimultaneousMode(room.modeId)
+      ? ![...room.players.keys()].every((id) => room.doneIds.has(id) || room.assignments[id]?.segmentIds.length === 0)
+      : room.turnIndex < room.turnOrder.length;
+    if (!stillWaiting) {
+      room.gameState = 'VOTING';
+      room.votes = new Map();
+    }
+  }
+  broadcastRoom(roomId);
+}
 
 httpServer.listen(PORT, () => {
   console.log(`Socket.io server rodando em http://localhost:${PORT}`);
