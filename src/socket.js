@@ -1,6 +1,12 @@
 import { io } from 'socket.io-client';
 
-export const SERVER_URL = 'https://voiceover-challenge-production.up.railway.app';
+// Production talks to the deployed Railway server; `npm run dev` talks to a
+// local one (that's what `npm run dev:all` starts, and what the connection
+// error in network.js already tells the player to run) so server changes can
+// actually be exercised without editing this file and risking committing it.
+export const SERVER_URL = import.meta.env.DEV
+  ? 'http://localhost:3001'
+  : 'https://voiceover-challenge-production.up.railway.app';
 
 const PLAYER_TOKEN_KEY = 'vc-player-token';
 

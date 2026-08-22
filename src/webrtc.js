@@ -307,13 +307,26 @@ function waitForDataChannel(peerId) {
   });
 }
 
+const BUFFER_DRAIN_TIMEOUT_MS = 30000;
+
+// Resolves once the channel has drained enough to accept more chunks. A peer
+// that stops reading (tab frozen, connection half-dead) would otherwise never
+// drain and leave the sender polling forever, so give up after a while and
+// let the caller move on instead of hanging the round.
 function waitForBufferLow(dc) {
   if (dc.bufferedAmount < BUFFERED_AMOUNT_HIGH) return Promise.resolve();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + BUFFER_DRAIN_TIMEOUT_MS;
     const poll = setInterval(() => {
-      if (dc.bufferedAmount < BUFFERED_AMOUNT_HIGH) {
+      if (dc.readyState !== 'open') {
+        clearInterval(poll);
+        reject(new Error('Canal de dados fechou durante o envio.'));
+      } else if (dc.bufferedAmount < BUFFERED_AMOUNT_HIGH) {
         clearInterval(poll);
         resolve();
+      } else if (Date.now() > deadline) {
+        clearInterval(poll);
+        reject(new Error('Envio travado — o outro jogador parou de receber.'));
       }
     }, 40);
   });
@@ -341,11 +354,28 @@ export async function sendFileToPeer(peerId, blob, meta = {}) {
 
 /** Sends `blob` to every currently connected peer; failures are per-peer and logged, not thrown. */
 export function sendFileToAllPeers(blob, meta = {}) {
+  return sendFilesToAllPeers([{ blob, meta }]);
+}
+
+/**
+ * Sends several files to every peer, waiting on each peer's data channel
+ * ONCE up front instead of per file. Sending them one call at a time meant a
+ * peer whose channel never opened cost the full DATA_CHANNEL_TIMEOUT_MS for
+ * every single file — with a dub of a dozen lines that's minutes of the
+ * sender sitting on "enviando…" while the rest of the room waits on them.
+ * Failures stay per-peer and logged, never thrown.
+ */
+export function sendFilesToAllPeers(files) {
   return Promise.all(
-    [...peers.keys()].map((id) =>
-      sendFileToPeer(id, blob, meta).catch((err) => {
-        console.error(`Falha ao enviar arquivo para ${id}:`, err);
-      })
-    )
+    [...peers.keys()].map(async (id) => {
+      try {
+        await waitForDataChannel(id);
+        for (const { blob, meta } of files) {
+          await sendFileToPeer(id, blob, meta);
+        }
+      } catch (err) {
+        console.error(`Falha ao enviar arquivo(s) para ${id}:`, err);
+      }
+    })
   );
 }

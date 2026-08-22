@@ -1,5 +1,5 @@
 import { socket } from './socket.js';
-import { sendFileToAllPeers } from './webrtc.js';
+import { sendFileToAllPeers, sendFilesToAllPeers } from './webrtc.js';
 import { fetchCloudClipBlob } from './cloudClips.js';
 import {
   createResources,
@@ -55,6 +55,12 @@ let recordingInProgress = false;
 let presentationQueue = null; // array of playerIds, or ['__coop__'] for the merged team dub
 let presentationIndex = 0;
 let presentationDone = false;
+// Which queue item is currently mounted, and its playback handle. The server
+// rebroadcasts room-update on every vote, and without tracking this, each
+// other player voting would remount this screen and restart the dub the
+// player is still watching (same trap as votingFormActive below).
+let presentationMountedIndex = null;
+let presentationPlayback = null;
 
 // True while the score form is up for this client — guards it the same way
 // as recordingInProgress, so another player's vote landing mid-broadcast
@@ -83,10 +89,14 @@ export function initOnlineGame({ overlayId, openBtnId } = {}) {
   document.getElementById(openBtnId || 'online-game-btn')?.addEventListener('click', open);
 
   socket.on('room-update', (snapshot) => {
-    const roundChanged = latestSnapshot?.clips !== snapshot.clips;
+    // Every broadcast arrives deserialized, so `snapshot.clips` is a brand
+    // new array each time and can't be compared by identity to detect a new
+    // round — doing that wiped the transfer progress on every single update.
+    // Entering PICKING is the actual "new round" edge.
+    const roundStarted = latestSnapshot?.gameState !== 'PICKING' && snapshot.gameState === 'PICKING';
     latestSnapshot = snapshot;
     if (snapshot.gameState === 'LOBBY') resetRoundState();
-    else if (roundChanged) receiveProgress.clear();
+    else if (roundStarted) receiveProgress.clear();
     if (overlayEl.classList.contains('menu-hidden')) return;
     maybeAutoConfirmClipReady();
     maybeFetchCloudClips();
@@ -104,6 +114,9 @@ function resetRoundState() {
   presentationQueue = null;
   presentationIndex = 0;
   presentationDone = false;
+  presentationPlayback?.stop();
+  presentationPlayback = null;
+  presentationMountedIndex = null;
   votingFormActive = false;
   myVoteSubmitted = false;
   clearVoteTimer();
@@ -157,8 +170,13 @@ function handleFileReceived(fromId, meta, blob) {
 }
 
 function handleFileProgress(fromId, meta, progress) {
-  if (meta.kind === 'clip') receiveProgress.set(fromId, progress);
-  render();
+  if (meta.kind !== 'clip') return;
+  // Fires once per 16KB chunk — a full re-render each time would rebuild the
+  // whole card thousands of times over a single clip. The readout is rounded
+  // to whole percent anyway, so only redraw when that number actually moves.
+  const shown = Math.round((receiveProgress.get(fromId) || 0) * 100);
+  receiveProgress.set(fromId, progress);
+  if (Math.round(progress * 100) !== shown) render();
 }
 
 async function finalizeReceivedClip(clipIndex, blob) {
@@ -369,6 +387,38 @@ function renderDubbing() {
   return latestSnapshot.modeId === 'coop' ? renderSequentialDubbing() : renderSimultaneousDubbing();
 }
 
+// Hard cap on the "sharing your dub" step. The whole room is blocked on this
+// player's turn-done until it finishes, so a peer with a half-dead WebRTC
+// link must never be able to hold the round hostage: give up on the transfer
+// and let the round move on rather than leaving everyone else watching a
+// player who has, from their side, already finished.
+const SHARE_TIMEOUT_MS = 45000;
+
+async function shareRecordingsAndFinish(recordings) {
+  allRecordings.set(socket.id, recordings);
+  cardEl.innerHTML = `
+    <h2 class="menu-logo" style="font-size:20px;">ENVIANDO SUA DUBLAGEM</h2>
+    <p class="menu-status">Compartilhando com os outros jogadores…</p>
+  `;
+
+  const files = [...recordings].map(([segmentId, blob]) => ({
+    blob,
+    meta: { kind: 'recording', playerId: socket.id, segmentId },
+  }));
+
+  try {
+    await Promise.race([
+      sendFilesToAllPeers(files),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Envio demorou demais.')), SHARE_TIMEOUT_MS)),
+    ]);
+  } catch (err) {
+    console.error('Não deu pra compartilhar a dublagem com todo mundo:', err);
+  }
+
+  recordingInProgress = false;
+  socket.emit('turn-done');
+}
+
 // 'coop': one clip, characters split across players — still one at a time
 // so it reads like a shared performance, in turnOrder order.
 function renderSequentialDubbing() {
@@ -421,18 +471,7 @@ function renderSequentialDubbing() {
   recordingInProgress = true;
   runGuidedRecording(cardEl, resources, myClip, {
     titleText: `DUBLANDO — ${myName()}`,
-    onDone: async (recordings) => {
-      allRecordings.set(socket.id, recordings);
-      cardEl.innerHTML = `
-        <h2 class="menu-logo" style="font-size:20px;">ENVIANDO SUA DUBLAGEM</h2>
-        <p class="menu-status">Compartilhando com os outros jogadores…</p>
-      `;
-      for (const [segmentId, blob] of recordings) {
-        await sendFileToAllPeers(blob, { kind: 'recording', playerId: socket.id, segmentId });
-      }
-      recordingInProgress = false;
-      socket.emit('turn-done');
-    },
+    onDone: shareRecordingsAndFinish,
   });
 }
 
@@ -496,18 +535,7 @@ function renderSimultaneousDubbing() {
   recordingInProgress = true;
   runGuidedRecording(cardEl, resources, myClip, {
     titleText: `DUBLANDO — ${myName()}`,
-    onDone: async (recordings) => {
-      allRecordings.set(myId, recordings);
-      cardEl.innerHTML = `
-        <h2 class="menu-logo" style="font-size:20px;">ENVIANDO SUA DUBLAGEM</h2>
-        <p class="menu-status">Compartilhando com os outros jogadores…</p>
-      `;
-      for (const [segmentId, blob] of recordings) {
-        await sendFileToAllPeers(blob, { kind: 'recording', playerId: myId, segmentId });
-      }
-      recordingInProgress = false;
-      socket.emit('turn-done');
-    },
+    onDone: shareRecordingsAndFinish,
   });
 }
 
@@ -526,6 +554,7 @@ function renderPresentation() {
         ? ['__coop__']
         : latestSnapshot.players.filter((p) => p.id !== socket.id).map((p) => p.id);
     presentationIndex = 0;
+    presentationMountedIndex = null;
   }
 
   if (!presentationQueue.length) {
@@ -533,9 +562,15 @@ function renderPresentation() {
     return renderVoteForm();
   }
 
+  // Already on screen — leave it alone. Rebuilding would restart the dub
+  // from the top just because someone else voted or reconnected.
+  if (presentationMountedIndex === presentationIndex) return;
+
   const isLast = presentationIndex === presentationQueue.length - 1;
   const nextLabel = isLast ? 'Ir para votação 🗳' : 'Próxima dublagem ▶';
   const goNext = () => {
+    presentationPlayback?.stop();
+    presentationPlayback = null;
     if (isLast) presentationDone = true;
     else presentationIndex += 1;
     render();
@@ -543,24 +578,42 @@ function renderPresentation() {
 
   const current = presentationQueue[presentationIndex];
   const stepLabel = `Assistindo ${presentationIndex + 1}/${presentationQueue.length}`;
+  const clipIndex = current === '__coop__' ? 0 : (latestSnapshot.assignments?.[current]?.clipIndex ?? 0);
+  const clip = sharedClips[clipIndex];
+
+  presentationPlayback?.stop();
+  presentationPlayback = null;
+  presentationMountedIndex = presentationIndex;
+
+  // A clip that never finished transferring would otherwise blow up inside
+  // renderResultScreen (it reads clip.videoBlob), leaving this player frozen
+  // on the previous screen while the rest of the room waits on their vote.
+  if (!clip?.videoBlob) {
+    cardEl.innerHTML = `
+      <h2 class="menu-logo" style="font-size:20px;">DUBLAGEM INDISPONÍVEL</h2>
+      <p class="menu-tagline">${stepLabel}</p>
+      <p class="menu-status">Não foi possível receber esse clipe — seguindo em frente.</p>
+      <div class="menu-section"><button id="og-pres-next-btn" class="menu-btn-primary" type="button">${nextLabel}</button></div>
+    `;
+    cardEl.querySelector('#og-pres-next-btn').addEventListener('click', goNext);
+    return;
+  }
 
   if (current === '__coop__') {
     const merged = new Map();
     allRecordings.forEach((segMap) => segMap.forEach((blob, segId) => merged.set(segId, blob)));
-    renderResultScreen(cardEl, resources, sharedClips[0], merged, {
+    presentationPlayback = renderResultScreen(cardEl, resources, clip, merged, {
       title: 'Dublagem da equipe',
-      tagline: `${stepLabel} — ${sharedClips[0]?.name || ''}`,
+      tagline: `${stepLabel} — ${clip.name || ''}`,
       actions: [{ label: nextLabel, onClick: goNext }],
     });
     return;
   }
 
-  const clipIndex = latestSnapshot.assignments?.[current]?.clipIndex ?? 0;
-  const clip = sharedClips[clipIndex];
   const recordings = allRecordings.get(current) || new Map();
-  renderResultScreen(cardEl, resources, clip, recordings, {
+  presentationPlayback = renderResultScreen(cardEl, resources, clip, recordings, {
     title: `Dublagem de ${playerName(current)}`,
-    tagline: `${stepLabel} — ${clip?.name || ''}`,
+    tagline: `${stepLabel} — ${clip.name || ''}`,
     actions: [{ label: nextLabel, onClick: goNext }],
   });
 }
@@ -684,6 +737,10 @@ function renderResults() {
 function watchPlayerResult(playerId) {
   const clipIndex = latestSnapshot.assignments?.[playerId]?.clipIndex ?? 0;
   const clip = sharedClips[clipIndex];
+  if (!clip?.videoBlob) {
+    alert('Esse clipe não chegou até aqui — não dá pra rever essa dublagem.');
+    return;
+  }
   const recordings = allRecordings.get(playerId) || new Map();
   renderResultScreen(cardEl, resources, clip, recordings, {
     title: `Dublagem de ${playerName(playerId)}`,
@@ -693,11 +750,16 @@ function watchPlayerResult(playerId) {
 }
 
 function watchCoopResult() {
+  const clip = sharedClips[0];
+  if (!clip?.videoBlob) {
+    alert('Esse clipe não chegou até aqui — não dá pra rever essa dublagem.');
+    return;
+  }
   const merged = new Map();
   allRecordings.forEach((segMap) => segMap.forEach((blob, segId) => merged.set(segId, blob)));
-  renderResultScreen(cardEl, resources, sharedClips[0], merged, {
+  renderResultScreen(cardEl, resources, clip, merged, {
     title: 'Dublagem da equipe',
-    tagline: sharedClips[0]?.name,
+    tagline: clip.name,
     actions: [{ label: '◀ Voltar ao placar', className: 'menu-link', onClick: renderResults }],
   });
 }

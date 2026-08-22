@@ -138,7 +138,9 @@ function isSimultaneousMode(modeId) {
 
 // Decides, per player, which clip they dub and which of its segments are
 // theirs — the one place all 3 online modes actually differ.
-function computeAssignments(modeId, clips, turnOrder) {
+// `playerOrder` is the room's player list order (what the host saw while
+// picking); `turnOrder` is the shuffled speaking order.
+function computeAssignments(modeId, clips, turnOrder, playerOrder) {
   const assignments = {};
 
   if (modeId === 'coop') {
@@ -156,7 +158,11 @@ function computeAssignments(modeId, clips, turnOrder) {
   }
 
   if (modeId === 'different-clips') {
-    turnOrder.forEach((id, i) => {
+    // The host picked one clip per player walking the room's player list in
+    // order ("Clipe de Fulano — 2/3"), so clip i belongs to player i of that
+    // same list. Indexing by the *shuffled* turnOrder instead would hand
+    // players someone else's clip.
+    playerOrder.forEach((id, i) => {
       const clipIndex = i % clips.length;
       assignments[id] = { clipIndex, segmentIds: clips[clipIndex].segments.map((s) => s.id) };
     });
@@ -205,6 +211,65 @@ function broadcastRoom(roomId) {
   if (room) io.to(roomId).emit('room-update', roomSnapshot(room));
 }
 
+// ---------- Round state transitions ----------
+// Each gate the room waits behind ("everyone got the clip", "everyone
+// recorded", "everyone voted") lives in one function, so the event handlers
+// and the player-left path can't drift apart on what counts as ready.
+
+function startDubbing(room) {
+  room.gameState = 'DUBBING';
+  room.turnOrder = shuffle([...room.players.keys()]);
+  room.turnIndex = 0;
+  room.assignments = computeAssignments(room.modeId, room.clips, room.turnOrder, [...room.players.keys()]);
+  room.doneIds = new Set();
+}
+
+function startVoting(room) {
+  room.gameState = 'VOTING';
+  room.votes = new Map();
+}
+
+function tallyVotes(room) {
+  const totals = new Map([...room.players.keys()].map((id) => [id, 0]));
+  room.votes.forEach((scoresGiven) => {
+    scoresGiven.forEach((value, rateeId) => {
+      if (totals.has(rateeId)) totals.set(rateeId, totals.get(rateeId) + value);
+    });
+  });
+  room.scoreboard = [...totals.entries()]
+    .map(([playerId, score]) => ({ playerId, name: room.players.get(playerId)?.name, score }))
+    .sort((a, b) => b.score - a.score);
+  room.gameState = 'RESULTS';
+}
+
+function everyoneHasClips(room) {
+  return [...room.players.keys()].every((id) => room.clipReadyIds.has(id));
+}
+
+function everyoneRecorded(room) {
+  if (isSimultaneousMode(room.modeId)) {
+    return [...room.players.keys()].every(
+      (id) => room.doneIds.has(id) || room.assignments[id]?.segmentIds.length === 0
+    );
+  }
+  return room.turnIndex >= room.turnOrder.length;
+}
+
+function everyoneVoted(room) {
+  return [...room.players.keys()].every((id) => room.votes.has(id));
+}
+
+// Re-checks whatever gate the room is currently sitting behind. Called after
+// a player leaves: without it the room keeps waiting on someone who is no
+// longer here (a clip they'll never confirm, a take they'll never record, a
+// vote they'll never cast) and the round hangs for everyone else.
+function advanceRoomIfReady(room) {
+  if (!room.players.size) return;
+  if (room.gameState === 'PICKING' && everyoneHasClips(room)) startDubbing(room);
+  else if (room.gameState === 'DUBBING' && everyoneRecorded(room)) startVoting(room);
+  else if (room.gameState === 'VOTING' && everyoneVoted(room)) tallyVotes(room);
+}
+
 io.on('connection', (socket) => {
   let currentRoomId = null;
 
@@ -216,6 +281,15 @@ io.on('connection', (socket) => {
     }
     if (room.players.size >= MAX_PLAYERS) {
       callback?.({ error: 'Sala cheia (máximo de 8 jogadores).' });
+      return;
+    }
+    // A player who shows up after the round started has no clip, no
+    // assignment and no vote — and every "waiting on everyone" gate would
+    // then wait on them forever, hanging the round for the whole room.
+    // They wait for the next round instead. (Reconnecting players come back
+    // through rejoin-room, which keeps their existing seat.)
+    if (!asHost && room.gameState !== 'LOBBY') {
+      callback?.({ error: 'A partida já começou — espere a rodada atual terminar.' });
       return;
     }
 
@@ -231,7 +305,10 @@ io.on('connection', (socket) => {
     broadcastRoom(roomId);
   }
 
-  socket.on('create-room', ({ playerName, playerToken } = {}, callback) => {
+  // `payload` used to be just the player's name; a browser still running the
+  // previously deployed bundle keeps sending that, so accept both shapes.
+  socket.on('create-room', (payload, callback) => {
+    const { playerName, playerToken } = typeof payload === 'string' ? { playerName: payload } : payload || {};
     let roomId = makeRoomId();
     while (rooms.has(roomId)) roomId = makeRoomId();
     const room = { players: new Map(), pendingDisconnects: new Map(), hostId: socket.id };
@@ -273,9 +350,12 @@ io.on('connection', (socket) => {
 
     // Re-key every piece of per-player state from the old socket.id to the
     // new one so the reconnecting client resumes exactly where it left off.
-    const playerData = room.players.get(oldSocketId);
-    room.players.delete(oldSocketId);
-    room.players.set(socket.id, playerData);
+    // The player list is rebuilt in place rather than delete+set, because
+    // its order is what the host saw while picking a clip per player in
+    // 'different-clips' — moving them to the end would shift the clips.
+    const rekeyed = new Map();
+    room.players.forEach((data, id) => rekeyed.set(id === oldSocketId ? socket.id : id, data));
+    room.players = rekeyed;
 
     if (room.hostId === oldSocketId) room.hostId = socket.id;
     room.turnOrder = room.turnOrder.map((id) => (id === oldSocketId ? socket.id : id));
@@ -335,15 +415,9 @@ io.on('connection', (socket) => {
   // A non-host player confirms they received & decoded every clip P2P.
   socket.on('clip-ready', () => {
     const room = rooms.get(currentRoomId);
-    if (!room || room.gameState !== 'PICKING') return;
+    if (!room || room.gameState !== 'PICKING' || !room.players.has(socket.id)) return;
     room.clipReadyIds.add(socket.id);
-    if ([...room.players.keys()].every((id) => room.clipReadyIds.has(id))) {
-      room.gameState = 'DUBBING';
-      room.turnOrder = shuffle([...room.players.keys()]);
-      room.turnIndex = 0;
-      room.assignments = computeAssignments(room.modeId, room.clips, room.turnOrder);
-      room.doneIds = new Set();
-    }
+    if (everyoneHasClips(room)) startDubbing(room);
     broadcastRoom(currentRoomId);
   });
 
@@ -359,13 +433,7 @@ io.on('connection', (socket) => {
     if (isSimultaneousMode(room.modeId)) {
       if (!room.players.has(socket.id)) return;
       room.doneIds.add(socket.id);
-      const everyoneDone = [...room.players.keys()].every(
-        (id) => room.doneIds.has(id) || room.assignments[id]?.segmentIds.length === 0
-      );
-      if (everyoneDone) {
-        room.gameState = 'VOTING';
-        room.votes = new Map();
-      }
+      if (everyoneRecorded(room)) startVoting(room);
       broadcastRoom(currentRoomId);
       return;
     }
@@ -377,16 +445,14 @@ io.on('connection', (socket) => {
       room.turnIndex < room.turnOrder.length &&
       room.assignments[room.turnOrder[room.turnIndex]]?.segmentIds.length === 0
     );
-    if (room.turnIndex >= room.turnOrder.length) {
-      room.gameState = 'VOTING';
-      room.votes = new Map();
-    }
+    if (everyoneRecorded(room)) startVoting(room);
     broadcastRoom(currentRoomId);
   });
 
   socket.on('submit-votes', (scores) => {
     const room = rooms.get(currentRoomId);
-    if (!room || room.gameState !== 'VOTING' || !scores || typeof scores !== 'object') return;
+    if (!room || room.gameState !== 'VOTING' || !room.players.has(socket.id)) return;
+    if (!scores || typeof scores !== 'object') return;
     const clean = new Map();
     Object.entries(scores).forEach(([rateeId, value]) => {
       if (room.players.has(rateeId) && rateeId !== socket.id) {
@@ -395,18 +461,7 @@ io.on('connection', (socket) => {
     });
     room.votes.set(socket.id, clean);
 
-    if ([...room.players.keys()].every((id) => room.votes.has(id))) {
-      const totals = new Map([...room.players.keys()].map((id) => [id, 0]));
-      room.votes.forEach((scoresGiven) => {
-        scoresGiven.forEach((value, rateeId) => {
-          totals.set(rateeId, (totals.get(rateeId) || 0) + value);
-        });
-      });
-      room.scoreboard = [...totals.entries()]
-        .map(([playerId, score]) => ({ playerId, name: room.players.get(playerId)?.name, score }))
-        .sort((a, b) => b.score - a.score);
-      room.gameState = 'RESULTS';
-    }
+    if (everyoneVoted(room)) tallyVotes(room);
     broadcastRoom(currentRoomId);
   });
 
@@ -450,10 +505,18 @@ function finalizeDisconnect(roomId, socketId) {
   room.pendingDisconnects.delete(socketId);
   if (!room.players.delete(socketId)) return;
 
+  // Dropping someone earlier in the turn order shifts everyone after them
+  // down a slot — without adjusting turnIndex the room would skip the
+  // player who is actually up next (or run off the end of the list).
+  const turnPos = room.turnOrder.indexOf(socketId);
   room.turnOrder = room.turnOrder.filter((id) => id !== socketId);
+  if (turnPos !== -1 && turnPos < room.turnIndex) room.turnIndex -= 1;
+
   room.clipReadyIds?.delete(socketId);
   room.doneIds?.delete(socketId);
   room.votes?.delete(socketId);
+  room.votes?.forEach((scoresGiven) => scoresGiven.delete(socketId));
+  delete room.assignments[socketId];
 
   if (room.players.size === 0) {
     rooms.delete(roomId);
@@ -462,15 +525,19 @@ function finalizeDisconnect(roomId, socketId) {
   if (room.hostId === socketId) {
     room.hostId = room.players.keys().next().value;
   }
-  if (room.gameState === 'DUBBING') {
-    const stillWaiting = isSimultaneousMode(room.modeId)
-      ? ![...room.players.keys()].every((id) => room.doneIds.has(id) || room.assignments[id]?.segmentIds.length === 0)
-      : room.turnIndex < room.turnOrder.length;
-    if (!stillWaiting) {
-      room.gameState = 'VOTING';
-      room.votes = new Map();
-    }
+  // In coop the leaver may have been the player everyone was waiting on —
+  // skip ahead past anyone left with no lines so the turn lands on someone
+  // who can actually record.
+  while (
+    room.gameState === 'DUBBING' &&
+    !isSimultaneousMode(room.modeId) &&
+    room.turnIndex < room.turnOrder.length &&
+    room.assignments[room.turnOrder[room.turnIndex]]?.segmentIds.length === 0
+  ) {
+    room.turnIndex += 1;
   }
+
+  advanceRoomIfReady(room);
   broadcastRoom(roomId);
 }
 
